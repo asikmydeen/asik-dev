@@ -1,0 +1,84 @@
+#!/usr/bin/env bash
+set -Eeuo pipefail
+
+RTSP_URL="${RTSP_URL:-}"
+MODEL="${OPENROUTER_VISION_MODEL:-openrouter/free}"
+PROMPT="${*:-Describe everything visible in this image, including people, objects, text, and safety concerns.}"
+OUTPUT_DIR="${HOME}/camera-ai-output"
+STAMP="$(date +%Y%m%d-%H%M%S)"
+IMAGE="${OUTPUT_DIR}/frame-${STAMP}.jpg"
+RESULT="${OUTPUT_DIR}/analysis-${STAMP}.txt"
+PROVIDERS="${HOME}/.config/asik-dev/providers.env"
+
+[[ -f "$PROVIDERS" ]] && source "$PROVIDERS"
+
+if [[ -z "$RTSP_URL" ]]; then
+  printf 'RTSP_URL is not set. Example:\n' >&2
+  printf '  export RTSP_URL="rtsp://user:password@PHONE_IP:8554/live/0"\n' >&2
+  exit 2
+fi
+if [[ -z "${OPENROUTER_API_KEY:-}" ]]; then
+  printf 'OPENROUTER_API_KEY is missing. Run: asik-dev secrets set OPENROUTER_API_KEY\n' >&2
+  exit 2
+fi
+command -v ffmpeg >/dev/null || { printf 'ffmpeg is missing.\n' >&2; exit 2; }
+
+mkdir -p "$OUTPUT_DIR"
+chmod 700 "$OUTPUT_DIR"
+
+ffmpeg -hide_banner -loglevel error -rtsp_transport tcp -i "$RTSP_URL" \
+  -map 0:v:0 -frames:v 1 -vf "scale='min(1280,iw)':-2" -q:v 3 -y "$IMAGE"
+
+export CAMERA_AI_IMAGE="$IMAGE" CAMERA_AI_PROMPT="$PROMPT"
+export CAMERA_AI_MODEL="$MODEL" CAMERA_AI_RESULT="$RESULT"
+
+python3 <<'PY'
+import base64
+import json
+import os
+import sys
+import urllib.error
+import urllib.request
+from pathlib import Path
+
+image = Path(os.environ["CAMERA_AI_IMAGE"])
+result = Path(os.environ["CAMERA_AI_RESULT"])
+payload = {
+    "model": os.environ["CAMERA_AI_MODEL"],
+    "messages": [{
+        "role": "user",
+        "content": [
+            {"type": "text", "text": os.environ["CAMERA_AI_PROMPT"]},
+            {"type": "image_url", "image_url": {
+                "url": "data:image/jpeg;base64," + base64.b64encode(image.read_bytes()).decode("ascii")
+            }},
+        ],
+    }],
+    "temperature": 0.2,
+    "max_tokens": 800,
+}
+request = urllib.request.Request(
+    "https://openrouter.ai/api/v1/chat/completions",
+    data=json.dumps(payload).encode(),
+    method="POST",
+    headers={
+        "Authorization": "Bearer " + os.environ["OPENROUTER_API_KEY"],
+        "Content-Type": "application/json",
+        "HTTP-Referer": "https://github.com/asikmydeen/asik-dev",
+        "X-Title": "Asik Camera AI",
+    },
+)
+try:
+    with urllib.request.urlopen(request, timeout=120) as response:
+        data = json.loads(response.read())
+except urllib.error.HTTPError as exc:
+    print(f"OpenRouter HTTP {exc.code}: {exc.read().decode(errors='replace')}", file=sys.stderr)
+    raise SystemExit(1)
+text = data["choices"][0]["message"]["content"]
+if isinstance(text, list):
+    text = "\n".join(item.get("text", "") for item in text if isinstance(item, dict))
+text = str(text).strip()
+result.write_text(text + "\n", encoding="utf-8")
+print(text)
+print(f"\nImage: {image}\nAnalysis: {result}")
+PY
