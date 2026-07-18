@@ -1,0 +1,23 @@
+#!/usr/bin/env bash
+set -Eeuo pipefail
+
+PROVIDERS="${ASIK_DEV_PROVIDERS:-$HOME/.config/asik-dev/providers.env}"
+if [[ -r "$PROVIDERS" ]]; then
+  # shellcheck source=/dev/null
+  source "$PROVIDERS"
+fi
+
+if [[ -z "${ANTHROPIC_API_KEY:-}" ]]; then
+  printf 'ANTHROPIC_API_KEY is not set. Run: asik-dev secrets set ANTHROPIC_API_KEY\n' >&2
+  exit 2
+fi
+
+unset ANTHROPIC_BASE_URL ANTHROPIC_AUTH_TOKEN
+export ANTHROPIC_API_KEY
+
+claude_bin="$(command -v claude || true)"
+if [[ -z "$claude_bin" ]]; then
+  printf 'Claude Code is not installed. Run: asik-dev repair\n' >&2
+  exit 127
+fi
+exec "$claude_bin" "$@"
