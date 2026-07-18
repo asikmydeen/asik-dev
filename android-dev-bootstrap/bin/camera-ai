@@ -11,8 +11,10 @@ RESULT="${OUTPUT_DIR}/analysis-${STAMP}.txt"
 PROVIDERS="${HOME}/.config/asik-dev/providers.env"
 
 if [[ -f "$PROVIDERS" ]]; then
+  set -a
   # shellcheck source=/dev/null
   source "$PROVIDERS"
+  set +a
 fi
 
 if [[ -z "$RTSP_URL" ]]; then
