@@ -57,8 +57,24 @@ _install_nvm_node() {
     nvm install --lts
     nvm alias default "lts/*"
     nvm use default
-    corepack enable || true
-    npm install -g npm@latest pnpm@latest
+
+    node --version
+    npm --version
+  '
+}
+
+_install_pnpm() {
+  run_as_user '
+    set -e
+    export NVM_DIR="$HOME/.nvm"
+    # shellcheck source=/dev/null
+    source "$NVM_DIR/nvm.sh"
+    nvm use default >/dev/null
+
+    npm install -g --no-audit --no-fund pnpm@latest
+    hash -r
+    command -v pnpm >/dev/null
+    pnpm --version
   '
 }
 
@@ -89,7 +105,7 @@ _write_shell_config() {
   local block
   block="$(mktemp)"
   cat >"$block" <<'BLOCK'
-export PATH="$HOME/.local/bin:$HOME/.cargo/bin:$PATH"
+export PATH="$HOME/.local/bin:$HOME/.cargo/bin:$HOME/.cursor/bin:$HOME/.opencode/bin:$PATH"
 export NVM_DIR="$HOME/.nvm"
 [[ -s "$NVM_DIR/nvm.sh" ]] && source "$NVM_DIR/nvm.sh"
 [[ -s "$HOME/.config/asik-dev/providers.env" ]] && source "$HOME/.config/asik-dev/providers.env"
@@ -122,7 +138,8 @@ BLOCK
 
 module_shell() {
   run_step "Install Oh My Zsh, Powerlevel10k, and plugins" _install_zsh_stack
-  run_step "Install Node.js LTS, npm, and pnpm with NVM" _install_nvm_node
+  run_step "Install Node.js LTS and npm with NVM" _install_nvm_node
+  run_step "Install pnpm" _install_pnpm
   run_step "Install uv Python package manager" _install_uv
   run_step "Install Rust toolchain" _install_rust
   run_step "Install Go toolchain" _install_go
