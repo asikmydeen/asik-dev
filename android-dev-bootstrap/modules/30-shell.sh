@@ -99,7 +99,11 @@ _write_shell_config() {
 export PATH="$HOME/.local/bin:$HOME/.cargo/bin:$HOME/.cursor/bin:$HOME/.opencode/bin:$PATH"
 export NVM_DIR="$HOME/.nvm"
 [[ -s "$NVM_DIR/nvm.sh" ]] && source "$NVM_DIR/nvm.sh"
-[[ -s "$HOME/.config/asik-dev/providers.env" ]] && source "$HOME/.config/asik-dev/providers.env"
+if [[ -s "$HOME/.config/asik-dev/providers.env" ]]; then
+  set -a
+  source "$HOME/.config/asik-dev/providers.env"
+  set +a
+fi
 
 export ZSH="$HOME/.oh-my-zsh"
 ZSH_THEME="powerlevel10k/powerlevel10k"
