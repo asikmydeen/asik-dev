@@ -9,8 +9,8 @@ while IFS= read -r -d '' file; do
   bash -n "$file"
 done < <(
   find "$ROOT" -type f \
-    \( -name '*.sh' -o -path "$ROOT/bin/asik-dev" -o -path "$ROOT/bin/claude-*" \
-       -o -path "$ROOT/bin/aider-*" \) -print0
+    \( -name '*.sh' -o -path "$ROOT/bin/asik-dev" -o -path "$ROOT/bin/camera-ai" \
+       -o -path "$ROOT/bin/claude-*" -o -path "$ROOT/bin/aider-*" \) -print0
 )
 
 printf 'Checking Python syntax...\n'
@@ -37,8 +37,8 @@ if command -v shellcheck >/dev/null 2>&1; then
   printf 'Running ShellCheck...\n'
   mapfile -d '' shell_files < <(
     find "$ROOT" -type f \
-      \( -name '*.sh' -o -path "$ROOT/bin/asik-dev" -o -path "$ROOT/bin/claude-*" \
-         -o -path "$ROOT/bin/aider-*" \) -print0
+      \( -name '*.sh' -o -path "$ROOT/bin/asik-dev" -o -path "$ROOT/bin/camera-ai" \
+         -o -path "$ROOT/bin/claude-*" -o -path "$ROOT/bin/aider-*" \) -print0
   )
   shellcheck -x "${shell_files[@]}"
 fi
