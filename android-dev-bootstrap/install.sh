@@ -52,8 +52,7 @@ termux_phase() {
 
   command -v termux-wake-lock >/dev/null 2>&1 && termux-wake-lock || true
 
-  local ubuntu_rootfs="${PREFIX}/var/lib/proot-distro/installed-rootfs/ubuntu"
-  if [[ -d "$ubuntu_rootfs" ]]; then
+  if proot-distro login ubuntu -- /usr/bin/true >/dev/null 2>&1; then
     printf '[OK] Ubuntu proot-distro installation already exists.\n'
   else
     printf '[INFO] Installing Ubuntu 24.04 with proot-distro. Keep Termux open.\n'
