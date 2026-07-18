@@ -10,7 +10,10 @@ IMAGE="${OUTPUT_DIR}/frame-${STAMP}.jpg"
 RESULT="${OUTPUT_DIR}/analysis-${STAMP}.txt"
 PROVIDERS="${HOME}/.config/asik-dev/providers.env"
 
-[[ -f "$PROVIDERS" ]] && source "$PROVIDERS"
+if [[ -f "$PROVIDERS" ]]; then
+  # shellcheck source=/dev/null
+  source "$PROVIDERS"
+fi
 
 if [[ -z "$RTSP_URL" ]]; then
   printf 'RTSP_URL is not set. Example:\n' >&2
