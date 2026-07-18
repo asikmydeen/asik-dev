@@ -1,0 +1,28 @@
+#!/usr/bin/env bash
+set -Eeuo pipefail
+
+PROVIDERS="${ASIK_DEV_PROVIDERS:-$HOME/.config/asik-dev/providers.env}"
+if [[ -r "$PROVIDERS" ]]; then
+  # shellcheck source=/dev/null
+  source "$PROVIDERS"
+fi
+
+if [[ -z "${ZAI_API_KEY:-}" ]]; then
+  printf 'ZAI_API_KEY is not set. Run: asik-dev secrets set ZAI_API_KEY\n' >&2
+  exit 2
+fi
+
+export ANTHROPIC_BASE_URL="${ZAI_ANTHROPIC_BASE_URL:-https://api.z.ai/api/anthropic}"
+export ANTHROPIC_AUTH_TOKEN="$ZAI_API_KEY"
+unset ANTHROPIC_API_KEY
+export ANTHROPIC_DEFAULT_HAIKU_MODEL="${ANTHROPIC_DEFAULT_HAIKU_MODEL:-glm-4.5-air}"
+export ANTHROPIC_DEFAULT_SONNET_MODEL="${ANTHROPIC_DEFAULT_SONNET_MODEL:-glm-5.2}"
+export ANTHROPIC_DEFAULT_OPUS_MODEL="${ANTHROPIC_DEFAULT_OPUS_MODEL:-glm-5.2}"
+export API_TIMEOUT_MS="${API_TIMEOUT_MS:-3000000}"
+
+claude_bin="$(command -v claude || true)"
+if [[ -z "$claude_bin" ]]; then
+  printf 'Claude Code is not installed. Run: asik-dev repair\n' >&2
+  exit 127
+fi
+exec "$claude_bin" "$@"

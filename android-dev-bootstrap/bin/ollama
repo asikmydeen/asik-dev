@@ -1,0 +1,209 @@
+#!/usr/bin/env python3
+# Cloud-only Ollama-compatible CLI for direct ollama.com API access.
+
+from __future__ import annotations
+
+import json
+import os
+import subprocess
+import sys
+import urllib.error
+import urllib.request
+from typing import Any, Iterable
+
+VERSION = "1.1.0"
+
+
+def load_provider_environment() -> None:
+    """Load the managed provider file when the current shell has not sourced it yet."""
+    path = os.getenv(
+        "ASIK_DEV_PROVIDERS",
+        os.path.expanduser("~/.config/asik-dev/providers.env"),
+    )
+    if not os.path.isfile(path):
+        return
+    command = 'set -a; source "$1"; env -0'
+    completed = subprocess.run(
+        ["bash", "-c", command, "asik-dev", path],
+        check=False,
+        capture_output=True,
+    )
+    if completed.returncode != 0:
+        return
+    for entry in completed.stdout.split(b"\0"):
+        if b"=" not in entry:
+            continue
+        key, value = entry.split(b"=", 1)
+        os.environ.setdefault(key.decode(errors="ignore"), value.decode(errors="ignore"))
+
+
+load_provider_environment()
+BASE_URL = os.getenv("OLLAMA_HOST", "https://ollama.com").rstrip("/")
+API_KEY = os.getenv("OLLAMA_API_KEY", "")
+DEFAULT_MODEL = os.getenv("OLLAMA_MODEL", "qwen3-coder:480b")
+
+
+def headers() -> dict[str, str]:
+    result = {
+        "Content-Type": "application/json",
+        "User-Agent": f"asik-dev-ollama/{VERSION}",
+    }
+    if API_KEY:
+        result["Authorization"] = f"Bearer {API_KEY}"
+    return result
+
+
+def request_json(method: str, path: str, payload: dict[str, Any] | None = None) -> Any:
+    data = json.dumps(payload).encode() if payload is not None else None
+    req = urllib.request.Request(
+        f"{BASE_URL}{path}", data=data, headers=headers(), method=method
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=300) as response:
+            content_type = response.headers.get("content-type", "")
+            body = response.read()
+            if "json" in content_type or body[:1] in (b"{", b"["):
+                return json.loads(body)
+            return body.decode()
+    except urllib.error.HTTPError as exc:
+        detail = exc.read().decode(errors="replace")
+        raise RuntimeError(f"Ollama API returned HTTP {exc.code}: {detail}") from exc
+    except urllib.error.URLError as exc:
+        raise RuntimeError(f"Unable to reach {BASE_URL}: {exc.reason}") from exc
+
+
+def stream_chat(model: str, messages: list[dict[str, str]]) -> str:
+    payload = {"model": model, "messages": messages, "stream": True}
+    req = urllib.request.Request(
+        f"{BASE_URL}/api/chat",
+        data=json.dumps(payload).encode(),
+        headers=headers(),
+        method="POST",
+    )
+    full: list[str] = []
+    try:
+        with urllib.request.urlopen(req, timeout=1800) as response:
+            for raw_line in response:
+                line = raw_line.decode(errors="replace").strip()
+                if not line:
+                    continue
+                part = json.loads(line)
+                text = part.get("message", {}).get("content", "")
+                if text:
+                    print(text, end="", flush=True)
+                    full.append(text)
+                if part.get("done"):
+                    break
+        print()
+        return "".join(full)
+    except urllib.error.HTTPError as exc:
+        detail = exc.read().decode(errors="replace")
+        raise RuntimeError(f"Ollama API returned HTTP {exc.code}: {detail}") from exc
+
+
+def require_key() -> None:
+    if not API_KEY:
+        raise RuntimeError(
+            "OLLAMA_API_KEY is not set. Run: asik-dev secrets set OLLAMA_API_KEY"
+        )
+
+
+def iter_models(payload: Any) -> Iterable[dict[str, Any]]:
+    if isinstance(payload, dict):
+        models = payload.get("models", [])
+        if isinstance(models, list):
+            yield from (m for m in models if isinstance(m, dict))
+
+
+def cmd_list() -> None:
+    require_key()
+    payload = request_json("GET", "/api/tags")
+    print(f"{'NAME':48} {'SIZE':>12}  MODIFIED")
+    for model in iter_models(payload):
+        name = str(model.get("name") or model.get("model") or "")
+        size = model.get("size", "")
+        modified = str(model.get("modified_at", ""))
+        print(f"{name:48} {str(size):>12}  {modified}")
+
+
+def cmd_run(args: list[str]) -> None:
+    require_key()
+    model = args[0] if args else DEFAULT_MODEL
+    prompt = " ".join(args[1:]).strip() if len(args) > 1 else ""
+    messages: list[dict[str, str]] = []
+
+    if prompt:
+        messages.append({"role": "user", "content": prompt})
+        reply = stream_chat(model, messages)
+        messages.append({"role": "assistant", "content": reply})
+        return
+
+    print(f"Cloud model: {model}. Type /bye to exit.")
+    while True:
+        try:
+            prompt = input(">>> ").strip()
+        except (EOFError, KeyboardInterrupt):
+            print()
+            return
+        if not prompt:
+            continue
+        if prompt in {"/bye", "/exit", "bye", "exit"}:
+            return
+        messages.append({"role": "user", "content": prompt})
+        reply = stream_chat(model, messages)
+        messages.append({"role": "assistant", "content": reply})
+
+
+def help_text() -> str:
+    return f"""Cloud-only Ollama API wrapper {VERSION}
+
+Usage:
+  ollama list
+  ollama run [MODEL] [PROMPT...]
+  ollama signin
+  ollama version
+  ollama help
+
+Defaults:
+  host:  {BASE_URL}
+  model: {DEFAULT_MODEL}
+
+This wrapper never starts a local daemon and never downloads local model weights.
+Set credentials with: asik-dev secrets set OLLAMA_API_KEY
+"""
+
+
+def main() -> int:
+    args = sys.argv[1:]
+    command = args.pop(0) if args else "help"
+
+    try:
+        if command in {"help", "--help", "-h"}:
+            print(help_text())
+        elif command in {"version", "--version", "-v"}:
+            print(f"asik-dev ollama-cloud {VERSION}")
+        elif command in {"list", "ls"}:
+            cmd_list()
+        elif command == "run":
+            cmd_run(args)
+        elif command == "signin":
+            print("Create an API key at ollama.com, then run:")
+            print("  asik-dev secrets set OLLAMA_API_KEY")
+        elif command in {"pull", "serve", "create", "rm", "stop"}:
+            print(
+                f"`ollama {command}` is a local-daemon operation and is intentionally "
+                "disabled in this cloud-only wrapper.",
+                file=sys.stderr,
+            )
+            return 2
+        else:
+            print(f"Unknown command: {command}\n\n{help_text()}", file=sys.stderr)
+            return 2
+    except (RuntimeError, json.JSONDecodeError) as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        return 1
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

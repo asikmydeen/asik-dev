@@ -1,0 +1,16 @@
+#!/usr/bin/env bash
+set -Eeuo pipefail
+PROVIDERS="${ASIK_DEV_PROVIDERS:-$HOME/.config/asik-dev/providers.env}"
+[[ -r "$PROVIDERS" ]] && source "$PROVIDERS"
+
+if [[ -z "${XAI_API_KEY:-}" ]]; then
+  printf 'XAI_API_KEY is not set. Run: asik-dev secrets set XAI_API_KEY\n' >&2
+  exit 2
+fi
+
+export OPENAI_API_KEY="$XAI_API_KEY"
+export OPENAI_API_BASE="${XAI_API_BASE:-https://api.x.ai/v1}"
+model="${AIDER_XAI_MODEL:-grok-4.5}"
+aider_bin="$(command -v aider || true)"
+[[ -n "$aider_bin" ]] || { printf 'Aider is not installed.\n' >&2; exit 127; }
+exec "$aider_bin" --model "openai/$model" "$@"
