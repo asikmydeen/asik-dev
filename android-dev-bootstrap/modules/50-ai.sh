@@ -7,21 +7,36 @@ _user_node_command() {
     set -e
     export NVM_DIR=\"\$HOME/.nvm\"
     [[ -s \"\$NVM_DIR/nvm.sh\" ]] && source \"\$NVM_DIR/nvm.sh\"
-    export PATH=\"\$HOME/.local/bin:\$HOME/.cargo/bin:\$PATH\"
+    export PATH=\"\$HOME/.local/bin:\$HOME/.cargo/bin:\$HOME/.opencode/bin:\$PATH\"
     ${command_string}
   "
 }
 
 _install_claude() {
-  _user_node_command 'npm install -g @anthropic-ai/claude-code@latest'
+  _user_node_command '
+    npm install -g --no-audit --no-fund @anthropic-ai/claude-code@latest
+    hash -r
+    command -v claude >/dev/null
+  '
 }
 
 _install_codex() {
-  _user_node_command 'npm install -g @openai/codex@latest'
+  _user_node_command '
+    npm install -g --no-audit --no-fund @openai/codex@latest
+    hash -r
+    command -v codex >/dev/null
+  '
 }
 
 _install_opencode() {
-  _user_node_command 'npm install -g opencode-ai@latest'
+  run_as_user '
+    set -e
+    export PATH="$HOME/.local/bin:$HOME/.opencode/bin:$PATH"
+    curl -fsSL https://opencode.ai/install | bash
+    hash -r
+    export PATH="$HOME/.opencode/bin:$HOME/.local/bin:$PATH"
+    command -v opencode >/dev/null
+  '
 }
 
 _install_aider() {
