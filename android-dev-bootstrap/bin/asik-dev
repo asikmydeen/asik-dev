@@ -1,0 +1,570 @@
+#!/usr/bin/env bash
+set -Eeuo pipefail
+
+VERSION="1.1.0"
+INSTALL_ROOT="${ASIK_DEV_INSTALL_ROOT:-/opt/asik-dev-bootstrap}"
+CONFIG_DIR="${XDG_CONFIG_HOME:-$HOME/.config}/asik-dev"
+PROVIDERS_FILE="${ASIK_DEV_PROVIDERS:-$CONFIG_DIR/providers.env}"
+MCP_FILE="$CONFIG_DIR/mcp.json"
+RAW_BASE="${ASIK_DEV_RAW_BASE:-https://raw.githubusercontent.com/asikmydeen/asik-dev/main/android-dev-bootstrap}"
+
+SECRET_KEYS=(
+  OPENAI_API_KEY
+  ANTHROPIC_API_KEY
+  ZAI_API_KEY
+  XAI_API_KEY
+  GEMINI_API_KEY
+  OPENROUTER_API_KEY
+  CURSOR_API_KEY
+  OLLAMA_API_KEY
+  BRAVE_API_KEY
+  TAVILY_API_KEY
+  GROQ_API_KEY
+  DEEPSEEK_API_KEY
+  TOGETHER_API_KEY
+  MISTRAL_API_KEY
+  CEREBRAS_API_KEY
+  AZURE_OPENAI_API_KEY
+  AZURE_OPENAI_ENDPOINT
+  AZURE_OPENAI_DEPLOYMENT
+  AWS_BEARER_TOKEN_BEDROCK
+  AWS_PROFILE
+  AWS_REGION
+  GOOGLE_CLOUD_PROJECT
+  VERTEX_LOCATION
+)
+
+declare -A KEY_DESCRIPTIONS=(
+  [OPENAI_API_KEY]="OpenAI API / Codex"
+  [ANTHROPIC_API_KEY]="Anthropic API / Claude Code"
+  [ZAI_API_KEY]="Z.AI GLM through Claude-compatible endpoint"
+  [XAI_API_KEY]="xAI API / Grok Build"
+  [GEMINI_API_KEY]="Google Gemini API for compatible tools"
+  [OPENROUTER_API_KEY]="OpenRouter"
+  [CURSOR_API_KEY]="Cursor Agent CLI and Background Agent API"
+  [OLLAMA_API_KEY]="Direct Ollama Cloud API"
+  [BRAVE_API_KEY]="Brave Search MCP"
+  [TAVILY_API_KEY]="Tavily search"
+  [GROQ_API_KEY]="Groq API"
+  [DEEPSEEK_API_KEY]="DeepSeek API"
+  [TOGETHER_API_KEY]="Together AI"
+  [MISTRAL_API_KEY]="Mistral API"
+  [CEREBRAS_API_KEY]="Cerebras API"
+  [AZURE_OPENAI_API_KEY]="Azure OpenAI key"
+  [AZURE_OPENAI_ENDPOINT]="Azure OpenAI endpoint"
+  [AZURE_OPENAI_DEPLOYMENT]="Azure OpenAI deployment"
+  [AWS_BEARER_TOKEN_BEDROCK]="AWS Bedrock API key, when used"
+  [AWS_PROFILE]="Default AWS profile"
+  [AWS_REGION]="Default AWS region"
+  [GOOGLE_CLOUD_PROJECT]="Default Google Cloud project"
+  [VERTEX_LOCATION]="Vertex AI location"
+)
+
+usage() {
+  cat <<'HELP'
+Asik Dev environment manager
+
+Usage:
+  asik-dev secrets                    Prompt for all missing/changed provider values
+  asik-dev secrets set KEY            Securely prompt for one value
+  asik-dev secrets clear KEY          Remove one value
+  asik-dev secrets status             Show which values are configured
+  asik-dev configure                  Regenerate shell/MCP integration
+  asik-dev doctor                     Run health checks
+  asik-dev versions                   Print installed tool versions
+  asik-dev update                     Update the full environment
+  asik-dev repair                     Rerun the idempotent installer
+  asik-dev backup [--include-secrets] Create a configuration backup
+  asik-dev help
+HELP
+}
+
+ensure_providers_file() {
+  mkdir -p "$CONFIG_DIR"
+  if [[ ! -f "$PROVIDERS_FILE" ]]; then
+    if [[ -r "$INSTALL_ROOT/templates/providers.env.example" ]]; then
+      cp "$INSTALL_ROOT/templates/providers.env.example" "$PROVIDERS_FILE"
+    else
+      : >"$PROVIDERS_FILE"
+    fi
+  fi
+  chmod 0600 "$PROVIDERS_FILE"
+}
+
+is_allowed_key() {
+  local candidate="$1" key
+  for key in "${SECRET_KEYS[@]}"; do
+    [[ "$candidate" == "$key" ]] && return 0
+  done
+  return 1
+}
+
+set_provider_value() {
+  local key="$1" value="$2"
+  ensure_providers_file
+  PROVIDERS_PATH="$PROVIDERS_FILE" PROVIDER_KEY="$key" PROVIDER_VALUE="$value" \
+    python3 - <<'PY_SET_PROVIDER'
+import os
+from pathlib import Path
+
+path = Path(os.environ["PROVIDERS_PATH"])
+key = os.environ["PROVIDER_KEY"]
+value = os.environ["PROVIDER_VALUE"]
+
+def quote_shell(text: str) -> str:
+    return "'" + text.replace("'", "'\"'\"'") + "'"
+
+lines = path.read_text().splitlines() if path.exists() else []
+replacement = f"{key}={quote_shell(value)}"
+output = []
+replaced = False
+for line in lines:
+    if line.startswith(f"{key}="):
+        if not replaced:
+            output.append(replacement)
+            replaced = True
+    else:
+        output.append(line)
+if not replaced:
+    output.append(replacement)
+path.write_text("\n".join(output).rstrip() + "\n")
+PY_SET_PROVIDER
+  chmod 0600 "$PROVIDERS_FILE"
+}
+
+load_providers() {
+  ensure_providers_file
+  set +u
+  # shellcheck source=/dev/null
+  source "$PROVIDERS_FILE"
+  set -u
+}
+
+provider_is_set() {
+  local key="$1"
+  load_providers
+  [[ -n "${!key:-}" ]]
+}
+
+secrets_status() {
+  local key
+  printf '%-30s %-12s %s\n' KEY STATUS PURPOSE
+  printf '%-30s %-12s %s\n' '------------------------------' '------------' '--------------------------'
+  for key in "${SECRET_KEYS[@]}"; do
+    if provider_is_set "$key"; then
+      printf '%-30s %-12s %s\n' "$key" configured "${KEY_DESCRIPTIONS[$key]}"
+    else
+      printf '%-30s %-12s %s\n' "$key" missing "${KEY_DESCRIPTIONS[$key]}"
+    fi
+  done
+  printf '\nSecrets file: %s (values are never displayed)\n' "$PROVIDERS_FILE"
+}
+
+prompt_one_secret() {
+  local key="$1" value
+  is_allowed_key "$key" || {
+    printf 'Unsupported key: %s\n' "$key" >&2
+    return 2
+  }
+  printf '%s — %s\n' "$key" "${KEY_DESCRIPTIONS[$key]}"
+  IFS= read -r -s -p "Value (blank keeps current): " value
+  printf '\n'
+  if [[ -n "$value" ]]; then
+    set_provider_value "$key" "$value"
+    printf 'Saved %s. Open a new shell or run: source %s\n' "$key" "$PROVIDERS_FILE"
+  else
+    printf 'No change.\n'
+  fi
+}
+
+prompt_all_secrets() {
+  local key value status
+  ensure_providers_file
+  printf 'Press Enter to keep/skip a value. Input is hidden.\n\n'
+  for key in "${SECRET_KEYS[@]}"; do
+    status="missing"
+    provider_is_set "$key" && status="configured"
+    printf '%s (%s) — %s\n' "$key" "$status" "${KEY_DESCRIPTIONS[$key]}"
+    IFS= read -r -s -p "New value: " value
+    printf '\n'
+    if [[ -n "$value" ]]; then
+      set_provider_value "$key" "$value"
+      printf 'Saved.\n'
+    fi
+    printf '\n'
+  done
+  secrets_status
+  printf '\nOpen a new shell, or run: source %s\n' "$PROVIDERS_FILE"
+}
+
+clear_secret() {
+  local key="$1"
+  is_allowed_key "$key" || {
+    printf 'Unsupported key: %s\n' "$key" >&2
+    return 2
+  }
+  set_provider_value "$key" ""
+  printf 'Cleared %s.\n' "$key"
+}
+
+write_mcp_configs() {
+  ensure_providers_file
+  mkdir -p \
+    "$CONFIG_DIR" \
+    "$HOME/projects" \
+    "$HOME/.cursor" \
+    "$HOME/.gemini/config" \
+    "$HOME/.config/opencode" \
+    "$HOME/.grok"
+
+  ASIK_HOME="$HOME" ASIK_MCP_FILE="$MCP_FILE" python3 - <<'PY_MCP_CONFIG'
+import json
+import os
+from pathlib import Path
+
+home = Path(os.environ["ASIK_HOME"])
+projects = str(home / "projects")
+
+servers = {
+    "filesystem": {
+        "command": "npx",
+        "args": ["-y", "@modelcontextprotocol/server-filesystem", projects],
+    },
+    "memory": {
+        "command": "npx",
+        "args": ["-y", "@modelcontextprotocol/server-memory"],
+    },
+    "sequential-thinking": {
+        "command": "npx",
+        "args": ["-y", "@modelcontextprotocol/server-sequential-thinking"],
+    },
+}
+
+canonical = {"mcpServers": servers}
+targets = [
+    Path(os.environ["ASIK_MCP_FILE"]),
+    home / ".cursor" / "mcp.json",
+    home / ".gemini" / "config" / "mcp_config.json",
+]
+for target in targets:
+    target.parent.mkdir(parents=True, exist_ok=True)
+    target.write_text(json.dumps(canonical, indent=2) + "\n")
+
+opencode = {
+    "$schema": "https://opencode.ai/config.json",
+    "mcp": {
+        name: {
+            "type": "local",
+            "command": [server["command"], *server["args"]],
+            "enabled": True,
+        }
+        for name, server in servers.items()
+    },
+    "permission": {
+        "read": "ask",
+        "edit": "ask",
+        "bash": "ask",
+    },
+}
+opencode_path = home / ".config" / "opencode" / "opencode.json"
+opencode_path.write_text(json.dumps(opencode, indent=2) + "\n")
+PY_MCP_CONFIG
+
+  chmod 0644 \
+    "$MCP_FILE" \
+    "$HOME/.cursor/mcp.json" \
+    "$HOME/.gemini/config/mcp_config.json" \
+    "$HOME/.config/opencode/opencode.json"
+}
+
+write_grok_mcp() {
+  local file="$HOME/.grok/config.toml"
+  local begin="# >>> asik-dev:mcp >>>"
+  local end="# <<< asik-dev:mcp <<<"
+  local tmp
+  tmp="$(mktemp)"
+
+  if [[ -f "$file" ]]; then
+    awk -v begin="$begin" -v end="$end" '
+      $0 == begin {skip=1; next}
+      $0 == end   {skip=0; next}
+      !skip       {print}
+    ' "$file" >"$tmp"
+  fi
+
+  {
+    cat "$tmp"
+    printf '\n%s\n' "$begin"
+    cat <<GROK_MCP
+[mcp_servers.filesystem]
+command = "npx"
+args = ["-y", "@modelcontextprotocol/server-filesystem", "$HOME/projects"]
+startup_timeout_sec = 60
+
+[mcp_servers.memory]
+command = "npx"
+args = ["-y", "@modelcontextprotocol/server-memory"]
+startup_timeout_sec = 60
+
+[mcp_servers.sequential-thinking]
+command = "npx"
+args = ["-y", "@modelcontextprotocol/server-sequential-thinking"]
+startup_timeout_sec = 60
+GROK_MCP
+    printf '%s\n' "$end"
+  } >"${tmp}.new"
+
+  mkdir -p "$(dirname "$file")"
+  mv "${tmp}.new" "$file"
+  chmod 0600 "$file"
+  rm -f "$tmp"
+}
+
+configure_cli_mcp() {
+  local projects="$HOME/projects"
+
+  if command -v claude >/dev/null 2>&1; then
+    claude mcp remove filesystem --scope user >/dev/null 2>&1 || true
+    claude mcp remove memory --scope user >/dev/null 2>&1 || true
+    claude mcp remove sequential-thinking --scope user >/dev/null 2>&1 || true
+    claude mcp add filesystem --scope user -- \
+      npx -y @modelcontextprotocol/server-filesystem "$projects" >/dev/null 2>&1 || true
+    claude mcp add memory --scope user -- \
+      npx -y @modelcontextprotocol/server-memory >/dev/null 2>&1 || true
+    claude mcp add sequential-thinking --scope user -- \
+      npx -y @modelcontextprotocol/server-sequential-thinking >/dev/null 2>&1 || true
+  fi
+
+  if command -v codex >/dev/null 2>&1; then
+    codex mcp remove filesystem >/dev/null 2>&1 || true
+    codex mcp remove memory >/dev/null 2>&1 || true
+    codex mcp remove sequential-thinking >/dev/null 2>&1 || true
+    codex mcp add filesystem -- \
+      npx -y @modelcontextprotocol/server-filesystem "$projects" >/dev/null 2>&1 || true
+    codex mcp add memory -- \
+      npx -y @modelcontextprotocol/server-memory >/dev/null 2>&1 || true
+    codex mcp add sequential-thinking -- \
+      npx -y @modelcontextprotocol/server-sequential-thinking >/dev/null 2>&1 || true
+  fi
+}
+
+cmd_configure() {
+  ensure_providers_file
+  write_mcp_configs
+  write_grok_mcp
+  configure_cli_mcp
+  printf 'Configuration regenerated.\n'
+  printf 'Canonical MCP configuration: %s\n' "$MCP_FILE"
+}
+
+version_line() {
+  local name="$1"
+  shift
+  if command -v "$name" >/dev/null 2>&1; then
+    local output
+    output="$(timeout 15 "$@" 2>&1 | head -n 1 || true)"
+    printf '%-18s %s\n' "$name" "${output:-installed}"
+  else
+    printf '%-18s %s\n' "$name" missing
+  fi
+}
+
+cmd_versions() {
+  version_line git git --version
+  version_line gh gh --version
+  version_line aws aws --version
+  version_line az az version --output tsv
+  version_line gcloud gcloud version
+  version_line terraform terraform version
+  version_line tofu tofu version
+  version_line kubectl kubectl version --client
+  version_line helm helm version --short
+  version_line k9s k9s version --short
+  version_line node node --version
+  version_line npm npm --version
+  version_line pnpm pnpm --version
+  version_line python3 python3 --version
+  version_line uv uv --version
+  version_line go go version
+  version_line rustc rustc --version
+  version_line claude claude --version
+  version_line codex codex --version
+  version_line cursor-agent cursor-agent --version
+  version_line grok grok --version
+  version_line agy agy --version
+  version_line opencode opencode --version
+  version_line aider aider --version
+  version_line ollama ollama version
+}
+
+check_command() {
+  local name="$1"
+  if command -v "$name" >/dev/null 2>&1; then
+    printf '[OK]   %s\n' "$name"
+    return 0
+  fi
+  printf '[MISS] %s\n' "$name"
+  return 1
+}
+
+check_json() {
+  local file="$1"
+  if [[ -f "$file" ]] && python3 -m json.tool "$file" >/dev/null 2>&1; then
+    printf '[OK]   valid JSON: %s\n' "$file"
+    return 0
+  fi
+  printf '[FAIL] invalid/missing JSON: %s\n' "$file"
+  return 1
+}
+
+cmd_doctor() {
+  local failures=0 tool
+  local tools=(
+    git gh aws az gcloud terraform tofu kubectl helm k9s kubectx kubens
+    node npm pnpm python3 uv go rustc claude codex cursor-agent grok agy
+    opencode aider ollama
+  )
+
+  printf 'Asik Dev doctor %s\n\n' "$VERSION"
+  for tool in "${tools[@]}"; do
+    check_command "$tool" || failures=$((failures + 1))
+  done
+
+  printf '\nConfiguration\n'
+  ensure_providers_file
+  local mode
+  mode="$(stat -c '%a' "$PROVIDERS_FILE" 2>/dev/null || true)"
+  if [[ "$mode" == "600" ]]; then
+    printf '[OK]   secrets file mode 600\n'
+  else
+    printf '[FAIL] secrets file mode is %s, expected 600\n' "${mode:-unknown}"
+    failures=$((failures + 1))
+  fi
+
+  check_json "$MCP_FILE" || failures=$((failures + 1))
+  check_json "$HOME/.cursor/mcp.json" || failures=$((failures + 1))
+  check_json "$HOME/.gemini/config/mcp_config.json" || failures=$((failures + 1))
+  check_json "$HOME/.config/opencode/opencode.json" || failures=$((failures + 1))
+
+  printf '\nAuthentication (non-destructive checks)\n'
+  if command -v gh >/dev/null 2>&1 && timeout 15 gh auth status >/dev/null 2>&1; then
+    printf '[OK]   GitHub CLI authenticated\n'
+  else
+    printf '[INFO] GitHub: run `gh auth login`\n'
+  fi
+
+  if command -v aws >/dev/null 2>&1 && timeout 20 aws sts get-caller-identity >/dev/null 2>&1; then
+    printf '[OK]   AWS credentials valid\n'
+  else
+    printf '[INFO] AWS: run `aws configure sso` or correct ~/.aws credentials\n'
+  fi
+
+  if command -v az >/dev/null 2>&1 && timeout 15 az account show >/dev/null 2>&1; then
+    printf '[OK]   Azure CLI authenticated\n'
+  else
+    printf '[INFO] Azure: run `az login --use-device-code`\n'
+  fi
+
+  if command -v gcloud >/dev/null 2>&1 && \
+      timeout 15 gcloud auth list --filter=status:ACTIVE --format='value(account)' |
+      grep -q .; then
+    printf '[OK]   Google Cloud CLI authenticated\n'
+  else
+    printf '[INFO] Google Cloud: run `gcloud auth login --no-launch-browser`\n'
+  fi
+
+  if command -v cursor-agent >/dev/null 2>&1 && \
+      timeout 15 cursor-agent status >/dev/null 2>&1; then
+    printf '[OK]   Cursor Agent authenticated or API key recognized\n'
+  else
+    printf '[INFO] Cursor: set CURSOR_API_KEY or run `cursor-agent login`\n'
+  fi
+
+  printf '\nProvider keys\n'
+  secrets_status
+
+  printf '\nDoctor result: %d missing/invalid installation checks.\n' "$failures"
+  return "$failures"
+}
+
+cmd_update() {
+  local target_user
+  target_user="$(id -un)"
+  [[ "$target_user" == "root" ]] && target_user="${ASIK_DEV_USER:-asik}"
+  curl -fsSL "$RAW_BASE/install.sh" |
+    bash -s -- --user "$target_user" --update --non-interactive
+}
+
+cmd_backup() {
+  local include_secrets=0
+  [[ "${1:-}" == "--include-secrets" ]] && include_secrets=1
+  local output="$HOME/asik-dev-backup-$(date +%Y%m%d-%H%M%S).tar.gz"
+  local staging
+  staging="$(mktemp -d)"
+  mkdir -p "$staging/config"
+
+  [[ -d "$CONFIG_DIR" ]] && cp -a "$CONFIG_DIR/." "$staging/config/"
+  if [[ "$include_secrets" -eq 0 ]]; then
+    rm -f "$staging/config/providers.env"
+  fi
+  [[ -f "$HOME/.zshrc" ]] && cp "$HOME/.zshrc" "$staging/"
+  [[ -f "$HOME/.bashrc" ]] && cp "$HOME/.bashrc" "$staging/"
+  [[ -f "$HOME/.grok/config.toml" ]] && {
+    mkdir -p "$staging/grok"
+    cp "$HOME/.grok/config.toml" "$staging/grok/"
+  }
+
+  tar -czf "$output" -C "$staging" .
+  rm -rf "$staging"
+  chmod 0600 "$output"
+  printf 'Backup created: %s\n' "$output"
+  if [[ "$include_secrets" -eq 0 ]]; then
+    printf 'Secrets were excluded. Use --include-secrets only for encrypted storage.\n'
+  fi
+}
+
+cmd_secrets() {
+  local action="${1:-prompt}"
+  case "$action" in
+    prompt)
+      prompt_all_secrets
+      ;;
+    set)
+      [[ -n "${2:-}" ]] || { printf 'Usage: asik-dev secrets set KEY\n' >&2; return 2; }
+      prompt_one_secret "$2"
+      ;;
+    clear)
+      [[ -n "${2:-}" ]] || { printf 'Usage: asik-dev secrets clear KEY\n' >&2; return 2; }
+      clear_secret "$2"
+      ;;
+    status)
+      secrets_status
+      ;;
+    *)
+      printf 'Unknown secrets action: %s\n' "$action" >&2
+      return 2
+      ;;
+  esac
+}
+
+main() {
+  local command="${1:-help}"
+  shift || true
+  case "$command" in
+    secrets) cmd_secrets "$@" ;;
+    configure) cmd_configure ;;
+    doctor) cmd_doctor ;;
+    versions) cmd_versions ;;
+    update|repair) cmd_update ;;
+    backup) cmd_backup "$@" ;;
+    help|-h|--help) usage ;;
+    version|--version|-v) printf 'asik-dev %s\n' "$VERSION" ;;
+    *)
+      printf 'Unknown command: %s\n\n' "$command" >&2
+      usage >&2
+      return 2
+      ;;
+  esac
+}
+
+main "$@"
