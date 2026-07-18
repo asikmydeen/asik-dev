@@ -1,0 +1,25 @@
+name: Android Dev Bootstrap
+
+on:
+  push:
+    paths:
+      - "android-dev-bootstrap/**"
+      - ".github/workflows/android-dev-bootstrap.yml"
+  pull_request:
+    paths:
+      - "android-dev-bootstrap/**"
+      - ".github/workflows/android-dev-bootstrap.yml"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  smoke:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install test dependencies
+        run: sudo apt-get update && sudo apt-get install -y shellcheck
+      - name: Run smoke tests
+        run: cd android-dev-bootstrap && tests/smoke.sh
