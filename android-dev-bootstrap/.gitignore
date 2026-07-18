@@ -1,0 +1,8 @@
+# Never commit credentials or generated state
+providers.env
+*.key
+*.pem
+*.log
+__pycache__/
+*.pyc
+.DS_Store
