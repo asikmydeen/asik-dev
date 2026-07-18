@@ -52,19 +52,29 @@ termux_phase() {
 
   command -v termux-wake-lock >/dev/null 2>&1 && termux-wake-lock || true
 
-  if ! proot-distro list 2>/dev/null | grep -qE '^[[:space:]]*ubuntu[[:space:]]'; then
+  local ubuntu_rootfs="${PREFIX}/var/lib/proot-distro/installed-rootfs/ubuntu"
+  if [[ -d "$ubuntu_rootfs" ]]; then
+    printf '[OK] Ubuntu proot-distro installation already exists.\n'
+  else
     printf '[INFO] Installing Ubuntu 24.04 with proot-distro. Keep Termux open.\n'
     proot-distro install ubuntu:24.04 --name ubuntu
-  else
-    printf '[OK] Ubuntu proot-distro installation already exists.\n'
   fi
+
+  local forwarded_args=""
+  [[ "$UPDATE_MODE" -eq 1 ]] && forwarded_args=" --update"
+  [[ "$NON_INTERACTIVE" -eq 1 ]] && forwarded_args+=" --non-interactive"
 
   cat >"$HOME/asik-dev-next.sh" <<NEXT
 #!/data/data/com.termux/files/usr/bin/bash
 set -e
-proot-distro login ubuntu -- bash -lc 'unset TERMUX_VERSION PREFIX; curl -fsSL ${RAW_BASE}/install.sh | bash'
+proot-distro login ubuntu -- bash -lc 'unset TERMUX_VERSION PREFIX; curl -fsSL ${RAW_BASE}/install.sh | bash -s --${forwarded_args}'
 NEXT
   chmod 0755 "$HOME/asik-dev-next.sh"
+
+  if [[ "$UPDATE_MODE" -eq 1 ]]; then
+    printf '[INFO] Continuing the update inside Ubuntu.\n'
+    exec "$HOME/asik-dev-next.sh"
+  fi
 
   cat <<NEXT
 
