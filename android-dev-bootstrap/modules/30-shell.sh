@@ -15,25 +15,21 @@ _install_zsh_stack() {
     ZSH_CUSTOM="${ZSH_CUSTOM:-$HOME/.oh-my-zsh/custom}"
 
     if [[ ! -d "$ZSH_CUSTOM/themes/powerlevel10k/.git" ]]; then
-      git clone --depth 1 https://github.com/romkatv/powerlevel10k.git \
-        "$ZSH_CUSTOM/themes/powerlevel10k"
+      git clone --depth 1 https://github.com/romkatv/powerlevel10k.git "$ZSH_CUSTOM/themes/powerlevel10k"
     else
       git -C "$ZSH_CUSTOM/themes/powerlevel10k" pull --ff-only
     fi
 
-    if [[ ! -d "$ZSH_CUSTOM/plugins/zsh-autosuggestions/.git" ]]; then
-      git clone --depth 1 https://github.com/zsh-users/zsh-autosuggestions \
-        "$ZSH_CUSTOM/plugins/zsh-autosuggestions"
-    else
-      git -C "$ZSH_CUSTOM/plugins/zsh-autosuggestions" pull --ff-only
-    fi
-
-    if [[ ! -d "$ZSH_CUSTOM/plugins/zsh-syntax-highlighting/.git" ]]; then
-      git clone --depth 1 https://github.com/zsh-users/zsh-syntax-highlighting \
-        "$ZSH_CUSTOM/plugins/zsh-syntax-highlighting"
-    else
-      git -C "$ZSH_CUSTOM/plugins/zsh-syntax-highlighting" pull --ff-only
-    fi
+    for repo in \
+      zsh-users/zsh-autosuggestions \
+      zsh-users/zsh-syntax-highlighting; do
+      name="${repo##*/}"
+      if [[ ! -d "$ZSH_CUSTOM/plugins/$name/.git" ]]; then
+        git clone --depth 1 "https://github.com/$repo" "$ZSH_CUSTOM/plugins/$name"
+      else
+        git -C "$ZSH_CUSTOM/plugins/$name" pull --ff-only
+      fi
+    done
   '
 }
 
@@ -52,12 +48,10 @@ _install_nvm_node() {
         PROFILE=/dev/null bash
     fi
 
-    # shellcheck source=/dev/null
     source "$NVM_DIR/nvm.sh"
     nvm install --lts
     nvm alias default "lts/*"
     nvm use default
-
     node --version
     npm --version
   '
@@ -67,13 +61,12 @@ _install_pnpm() {
   run_as_user '
     set -e
     export NVM_DIR="$HOME/.nvm"
-    # shellcheck source=/dev/null
     source "$NVM_DIR/nvm.sh"
     nvm use default >/dev/null
 
-    npm install -g --no-audit --no-fund pnpm@latest
+    corepack enable
+    corepack prepare pnpm@latest --activate
     hash -r
-    command -v pnpm >/dev/null
     pnpm --version
   '
 }
@@ -97,9 +90,7 @@ _install_rust() {
   '
 }
 
-_install_go() {
-  apt_install golang-go
-}
+_install_go() { apt_install golang-go; }
 
 _write_shell_config() {
   local block
@@ -112,7 +103,9 @@ export NVM_DIR="$HOME/.nvm"
 
 export ZSH="$HOME/.oh-my-zsh"
 ZSH_THEME="powerlevel10k/powerlevel10k"
-plugins=(git sudo fzf zsh-autosuggestions zsh-syntax-highlighting)
+# Ubuntu's packaged fzf plugin references files absent in minimal PRoot installs,
+# so fzf remains installed as a binary but is not loaded as an OMZ plugin.
+plugins=(git sudo zsh-autosuggestions zsh-syntax-highlighting)
 
 if [[ -s "$ZSH/oh-my-zsh.sh" ]]; then
   source "$ZSH/oh-my-zsh.sh"
@@ -139,7 +132,7 @@ BLOCK
 module_shell() {
   run_step "Install Oh My Zsh, Powerlevel10k, and plugins" _install_zsh_stack
   run_step "Install Node.js LTS and npm with NVM" _install_nvm_node
-  run_step "Install pnpm" _install_pnpm
+  run_step "Activate pnpm with Corepack" _install_pnpm
   run_step "Install uv Python package manager" _install_uv
   run_step "Install Rust toolchain" _install_rust
   run_step "Install Go toolchain" _install_go
