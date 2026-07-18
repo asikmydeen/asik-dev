@@ -11,20 +11,18 @@ import urllib.error
 import urllib.request
 from typing import Any, Iterable
 
-VERSION = "1.1.0"
+VERSION = "1.2.0"
 
 
 def load_provider_environment() -> None:
-    """Load the managed provider file when the current shell has not sourced it yet."""
     path = os.getenv(
         "ASIK_DEV_PROVIDERS",
         os.path.expanduser("~/.config/asik-dev/providers.env"),
     )
     if not os.path.isfile(path):
         return
-    command = 'set -a; source "$1"; env -0'
     completed = subprocess.run(
-        ["bash", "-c", command, "asik-dev", path],
+        ["bash", "-c", 'set -a; source "$1"; env -0', "asik-dev", path],
         check=False,
         capture_output=True,
     )
@@ -40,7 +38,7 @@ def load_provider_environment() -> None:
 load_provider_environment()
 BASE_URL = os.getenv("OLLAMA_HOST", "https://ollama.com").rstrip("/")
 API_KEY = os.getenv("OLLAMA_API_KEY", "")
-DEFAULT_MODEL = os.getenv("OLLAMA_MODEL", "qwen3-coder:480b")
+DEFAULT_MODEL = os.getenv("OLLAMA_MODEL", "gpt-oss:120b")
 
 
 def headers() -> dict[str, str]:
@@ -60,14 +58,14 @@ def request_json(method: str, path: str, payload: dict[str, Any] | None = None) 
     )
     try:
         with urllib.request.urlopen(req, timeout=300) as response:
-            content_type = response.headers.get("content-type", "")
             body = response.read()
-            if "json" in content_type or body[:1] in (b"{", b"["):
-                return json.loads(body)
-            return body.decode()
+            return json.loads(body) if body[:1] in (b"{", b"[") else body.decode()
     except urllib.error.HTTPError as exc:
         detail = exc.read().decode(errors="replace")
-        raise RuntimeError(f"Ollama API returned HTTP {exc.code}: {detail}") from exc
+        hint = ""
+        if exc.code == 410:
+            hint = "\nHint: this model was retired. Run `ollama list` and use an exact current model name."
+        raise RuntimeError(f"Ollama API returned HTTP {exc.code}: {detail}{hint}") from exc
     except urllib.error.URLError as exc:
         raise RuntimeError(f"Unable to reach {BASE_URL}: {exc.reason}") from exc
 
@@ -98,21 +96,20 @@ def stream_chat(model: str, messages: list[dict[str, str]]) -> str:
         return "".join(full)
     except urllib.error.HTTPError as exc:
         detail = exc.read().decode(errors="replace")
-        raise RuntimeError(f"Ollama API returned HTTP {exc.code}: {detail}") from exc
+        hint = ""
+        if exc.code == 410:
+            hint = "\nHint: this model was retired. Run `ollama list` and use an exact current model name."
+        raise RuntimeError(f"Ollama API returned HTTP {exc.code}: {detail}{hint}") from exc
 
 
 def require_key() -> None:
     if not API_KEY:
-        raise RuntimeError(
-            "OLLAMA_API_KEY is not set. Run: asik-dev secrets set OLLAMA_API_KEY"
-        )
+        raise RuntimeError("OLLAMA_API_KEY is not set. Run: asik-dev secrets set OLLAMA_API_KEY")
 
 
 def iter_models(payload: Any) -> Iterable[dict[str, Any]]:
-    if isinstance(payload, dict):
-        models = payload.get("models", [])
-        if isinstance(models, list):
-            yield from (m for m in models if isinstance(m, dict))
+    if isinstance(payload, dict) and isinstance(payload.get("models"), list):
+        yield from (m for m in payload["models"] if isinstance(m, dict))
 
 
 def cmd_list() -> None:
@@ -121,9 +118,7 @@ def cmd_list() -> None:
     print(f"{'NAME':48} {'SIZE':>12}  MODIFIED")
     for model in iter_models(payload):
         name = str(model.get("name") or model.get("model") or "")
-        size = model.get("size", "")
-        modified = str(model.get("modified_at", ""))
-        print(f"{name:48} {str(size):>12}  {modified}")
+        print(f"{name:48} {str(model.get('size', '')):>12}  {model.get('modified_at', '')}")
 
 
 def cmd_run(args: list[str]) -> None:
@@ -131,11 +126,9 @@ def cmd_run(args: list[str]) -> None:
     model = args[0] if args else DEFAULT_MODEL
     prompt = " ".join(args[1:]).strip() if len(args) > 1 else ""
     messages: list[dict[str, str]] = []
-
     if prompt:
         messages.append({"role": "user", "content": prompt})
-        reply = stream_chat(model, messages)
-        messages.append({"role": "assistant", "content": reply})
+        stream_chat(model, messages)
         return
 
     print(f"Cloud model: {model}. Type /bye to exit.")
@@ -168,15 +161,14 @@ Defaults:
   host:  {BASE_URL}
   model: {DEFAULT_MODEL}
 
-This wrapper never starts a local daemon and never downloads local model weights.
-Set credentials with: asik-dev secrets set OLLAMA_API_KEY
+Run `ollama list` before selecting a model because cloud models can be retired.
+This wrapper never starts a local daemon or downloads local model weights.
 """
 
 
 def main() -> int:
     args = sys.argv[1:]
     command = args.pop(0) if args else "help"
-
     try:
         if command in {"help", "--help", "-h"}:
             print(help_text())
@@ -190,11 +182,7 @@ def main() -> int:
             print("Create an API key at ollama.com, then run:")
             print("  asik-dev secrets set OLLAMA_API_KEY")
         elif command in {"pull", "serve", "create", "rm", "stop"}:
-            print(
-                f"`ollama {command}` is a local-daemon operation and is intentionally "
-                "disabled in this cloud-only wrapper.",
-                file=sys.stderr,
-            )
+            print(f"`ollama {command}` is disabled in this cloud-only wrapper.", file=sys.stderr)
             return 2
         else:
             print(f"Unknown command: {command}\n\n{help_text()}", file=sys.stderr)
