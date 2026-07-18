@@ -59,6 +59,34 @@ done
 
 RAW_BASE="https://raw.githubusercontent.com/${REPO}/${REF}/${SUBDIR}"
 
+_find_andronix_rootfs() {
+  local start_script="$1"
+  local script_dir folder candidate
+  local -a candidates=()
+
+  script_dir="$(cd "$(dirname "$start_script")" && pwd)"
+  folder="$(sed -nE \
+    's/^[[:space:]]*(folder|rootfs)[[:space:]]*=[[:space:]]*["'"']?([^"'"';[:space:]]+).*/\2/p' \
+    "$start_script" | head -n 1 || true)"
+
+  [[ -n "$folder" ]] && candidates+=("$script_dir/$folder")
+  candidates+=(
+    "$script_dir/ubuntu-fs"
+    "$script_dir/ubuntu20-fs"
+    "$script_dir/ubuntu22-fs"
+    "$script_dir/ubuntu24-fs"
+  )
+
+  for candidate in "${candidates[@]}"; do
+    if [[ -d "$candidate" && -x "$candidate/usr/bin/env" ]]; then
+      printf '%s\n' "$candidate"
+      return 0
+    fi
+  done
+
+  return 1
+}
+
 termux_phase() {
   printf '\n[INFO] Termux detected. Preparing the Android host.\n'
   pkg update -y || true
@@ -69,7 +97,7 @@ termux_phase() {
     termux-setup-storage || true
   fi
 
-  local start_script
+  local start_script rootfs
   start_script="$(find "$HOME" -maxdepth 4 -type f \
     \( -name 'start-ubuntu*.sh' -o -name 'startubuntu*.sh' \) \
     2>/dev/null | head -n 1 || true)"
@@ -83,16 +111,41 @@ NEXT
   chmod 0755 "$HOME/asik-dev-next.sh"
 
   if [[ -n "$start_script" ]]; then
-    cat <<FOUND
+    rootfs="$(_find_andronix_rootfs "$start_script" || true)"
+    if [[ -n "$rootfs" ]]; then
+      cat <<FOUND
 
-[OK] Found an Andronix Ubuntu launcher:
-  $start_script
+[OK] Found a usable Andronix Ubuntu installation:
+  Launcher: $start_script
+  Rootfs:   $rootfs
 
 Run it, then execute this inside Ubuntu:
 
   curl -fsSL ${RAW_BASE}/install.sh | bash
 
 FOUND
+    else
+      cat <<BROKEN
+
+[WARNING] Found an Ubuntu launcher, but its Linux filesystem is missing or incomplete:
+  $start_script
+
+A valid installation must contain an executable usr/bin/env inside the rootfs.
+Do not keep retrying the launcher. Reinstall Ubuntu from Andronix:
+  1. Optionally rename the broken files instead of deleting them:
+       stamp=\$(date +%Y%m%d-%H%M%S)
+       mv "$start_script" "${start_script}.broken-\$stamp"
+       [ ! -e "$HOME/ubuntu-fs" ] || mv "$HOME/ubuntu-fs" "$HOME/ubuntu-fs.broken-\$stamp"
+  2. Open Andronix and select Ubuntu, then CLI/unmodded installation.
+  3. Paste the newly generated installation command into Termux.
+  4. Leave Termux open and disable battery optimization until extraction completes.
+  5. Verify before launching:
+       test -x "$HOME/ubuntu-fs/usr/bin/env" && echo 'Ubuntu rootfs OK'
+  6. Start Ubuntu and run:
+       curl -fsSL ${RAW_BASE}/install.sh | bash
+
+BROKEN
+    fi
   else
     cat <<MISSING
 
