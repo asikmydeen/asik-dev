@@ -1,0 +1,14 @@
+#!/usr/bin/env bash
+set -Eeuo pipefail
+PROVIDERS="${ASIK_DEV_PROVIDERS:-$HOME/.config/asik-dev/providers.env}"
+[[ -r "$PROVIDERS" ]] && source "$PROVIDERS"
+
+if [[ -z "${OPENROUTER_API_KEY:-}" ]]; then
+  printf 'OPENROUTER_API_KEY is not set. Run: asik-dev secrets set OPENROUTER_API_KEY\n' >&2
+  exit 2
+fi
+
+model="${AIDER_OPENROUTER_MODEL:-anthropic/claude-sonnet-4.5}"
+aider_bin="$(command -v aider || true)"
+[[ -n "$aider_bin" ]] || { printf 'Aider is not installed.\n' >&2; exit 127; }
+exec "$aider_bin" --model "openrouter/$model" "$@"
