@@ -28,10 +28,10 @@ _install_aws_cli() {
   esac
 
   tmpdir="$(mktemp -d)"
+  register_cleanup_dir "$tmpdir"
   download_file "$url" "$tmpdir/awscliv2.zip"
   unzip -q "$tmpdir/awscliv2.zip" -d "$tmpdir"
   as_root "$tmpdir/aws/install" --update
-  rm -rf "$tmpdir"
 }
 
 _install_azure_cli() {
@@ -80,23 +80,24 @@ _install_opentofu() {
 }
 
 _install_kubectl() {
+  # improvement #9: SHA256 checksum verified via the official .sha256 file.
   local version arch tmpdir
   version="$(curl -fsSL https://dl.k8s.io/release/stable.txt)"
   arch="$(binary_arch)"
   [[ "$arch" == "arm64" || "$arch" == "amd64" ]] || return 1
 
   tmpdir="$(mktemp -d)"
+  register_cleanup_dir "$tmpdir"
   download_file "https://dl.k8s.io/release/${version}/bin/linux/${arch}/kubectl" \
     "$tmpdir/kubectl"
   download_file "https://dl.k8s.io/release/${version}/bin/linux/${arch}/kubectl.sha256" \
     "$tmpdir/kubectl.sha256"
 
-  (
-    cd "$tmpdir"
-    printf '%s  kubectl\n' "$(cat kubectl.sha256)" | sha256sum --check
-  )
+  local expected_hash
+  expected_hash="$(cat "$tmpdir/kubectl.sha256")"
+  verify_sha256 "$tmpdir/kubectl" "$expected_hash"
+
   as_root install -m 0755 "$tmpdir/kubectl" /usr/local/bin/kubectl
-  rm -rf "$tmpdir"
 }
 
 _install_helm() {
@@ -109,6 +110,7 @@ _install_helm() {
 }
 
 _install_k9s() {
+  # improvement #9: SHA256 checksum verified against the upstream checksums file.
   local arch version tmpdir
   arch="$(binary_arch)"
   case "$arch" in
@@ -122,12 +124,24 @@ _install_k9s() {
   [[ -n "$version" ]] || return 1
 
   tmpdir="$(mktemp -d)"
+  register_cleanup_dir "$tmpdir"
+
+  local tarball="k9s_Linux_${arch}.tar.gz"
+  local checksums_url="https://github.com/derailed/k9s/releases/download/${version}/checksums.sha256"
+
   download_file \
-    "https://github.com/derailed/k9s/releases/download/${version}/k9s_Linux_${arch}.tar.gz" \
-    "$tmpdir/k9s.tar.gz"
-  tar -xzf "$tmpdir/k9s.tar.gz" -C "$tmpdir" k9s
+    "https://github.com/derailed/k9s/releases/download/${version}/${tarball}" \
+    "$tmpdir/${tarball}"
+  download_file "$checksums_url" "$tmpdir/checksums.sha256"
+
+  # Extract the expected hash for this specific tarball from the checksums file.
+  local expected_hash
+  expected_hash="$(grep " ${tarball}$" "$tmpdir/checksums.sha256" | awk '{print $1}')"
+  [[ -n "$expected_hash" ]] || { _fail "Could not find checksum for ${tarball} in release checksums"; return 1; }
+  verify_sha256 "$tmpdir/${tarball}" "$expected_hash"
+
+  tar -xzf "$tmpdir/${tarball}" -C "$tmpdir" k9s
   as_root install -m 0755 "$tmpdir/k9s" /usr/local/bin/k9s
-  rm -rf "$tmpdir"
 }
 
 _install_kubectx_kubens() {

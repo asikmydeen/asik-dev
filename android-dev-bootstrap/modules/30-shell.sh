@@ -34,24 +34,38 @@ _install_zsh_stack() {
 }
 
 _install_nvm_node() {
+  # improvement #6: fully idempotent — skip the LTS download when the current
+  # LTS version is already installed and set as the NVM default.
   run_as_user '
     set -e
     export NVM_DIR="$HOME/.nvm"
     mkdir -p "$NVM_DIR"
 
-    version="$(curl -fsSL https://api.github.com/repos/nvm-sh/nvm/releases/latest |
+    nvm_version="$(curl -fsSL https://api.github.com/repos/nvm-sh/nvm/releases/latest |
       jq -r ".tag_name // empty" 2>/dev/null || true)"
-    version="${version:-v0.40.3}"
+    nvm_version="${nvm_version:-v0.40.3}"
 
     if [[ ! -s "$NVM_DIR/nvm.sh" ]]; then
-      curl -fsSL "https://raw.githubusercontent.com/nvm-sh/nvm/${version}/install.sh" |
+      curl -fsSL "https://raw.githubusercontent.com/nvm-sh/nvm/${nvm_version}/install.sh" |
         PROFILE=/dev/null bash
     fi
 
     source "$NVM_DIR/nvm.sh"
-    nvm install --lts
-    nvm alias default "lts/*"
-    nvm use default
+
+    # Resolve the latest available LTS alias without downloading it yet.
+    desired_lts="$(nvm version-remote --lts 2>/dev/null || true)"
+
+    if [[ -n "$desired_lts" ]] && nvm ls "$desired_lts" 2>/dev/null | grep -q "$desired_lts"; then
+      # LTS already installed — just make sure the alias and active version are correct.
+      nvm alias default "lts/*"
+      nvm use default
+      printf "[INFO] Node.js %s already installed, skipping download.\n" "$desired_lts"
+    else
+      nvm install --lts
+      nvm alias default "lts/*"
+      nvm use default
+    fi
+
     node --version
     npm --version
   '

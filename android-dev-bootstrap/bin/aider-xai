@@ -1,6 +1,7 @@
 #!/usr/bin/env bash
 set -Eeuo pipefail
 PROVIDERS="${ASIK_DEV_PROVIDERS:-$HOME/.config/asik-dev/providers.env}"
+# shellcheck source=/dev/null
 [[ -r "$PROVIDERS" ]] && source "$PROVIDERS"
 
 if [[ -z "${XAI_API_KEY:-}" ]]; then

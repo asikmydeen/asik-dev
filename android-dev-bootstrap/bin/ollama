@@ -7,11 +7,23 @@ import json
 import os
 import subprocess
 import sys
+import time
 import urllib.error
 import urllib.request
 from typing import Any, Iterable
 
-VERSION = "1.2.0"
+VERSION = "1.2.2"
+
+# ---------------------------------------------------------------------------
+# improvement #10: configurable retry and timeout settings
+# ---------------------------------------------------------------------------
+_REQUEST_TIMEOUT = int(os.getenv("OLLAMA_REQUEST_TIMEOUT", "300"))
+_STREAM_TIMEOUT = int(os.getenv("OLLAMA_STREAM_TIMEOUT", "1800"))
+_MAX_RETRIES = int(os.getenv("OLLAMA_MAX_RETRIES", "3"))
+_RETRY_INITIAL_DELAY = float(os.getenv("OLLAMA_RETRY_DELAY", "2.0"))
+
+# HTTP status codes that are worth retrying (transient errors).
+_RETRYABLE_HTTP_CODES = {429, 500, 502, 503, 504}
 
 
 def load_provider_environment() -> None:
@@ -51,23 +63,98 @@ def headers() -> dict[str, str]:
     return result
 
 
+def _url_error_hint(exc: urllib.error.URLError) -> str:
+    """
+    improvement #10: produce an actionable hint for URLError instead of
+    surfacing the raw socket/SSL reason string.
+    """
+    reason = str(exc.reason)
+    hints: list[str] = []
+    if "name or service not known" in reason.lower() or "nodename nor servname" in reason.lower():
+        hints.append("DNS resolution failed — check your internet connection.")
+    elif "timed out" in reason.lower():
+        hints.append(
+            f"Connection timed out after {_REQUEST_TIMEOUT}s. "
+            "You can raise this with: export OLLAMA_REQUEST_TIMEOUT=600"
+        )
+    elif "ssl" in reason.lower() or "certificate" in reason.lower():
+        hints.append("TLS/SSL error — your system certificates may be out of date.")
+    else:
+        hints.append("Check your network connection and firewall settings.")
+
+    hints.append(
+        f"If OLLAMA_HOST is set incorrectly, verify it points to the right endpoint "
+        f"(currently: {BASE_URL})."
+    )
+    hints.append("To change the API base, run: asik-dev secrets set OLLAMA_HOST")
+    return "\n".join(hints)
+
+
+def _request_with_retry(
+    req: urllib.request.Request,
+    timeout: int,
+    stream: bool = False,
+) -> Any:
+    """
+    improvement #10: retry transient HTTP errors and URLErrors with
+    exponential backoff before raising to the caller.
+    """
+    delay = _RETRY_INITIAL_DELAY
+    for attempt in range(1, _MAX_RETRIES + 2):  # +2 so the last attempt still runs
+        try:
+            response = urllib.request.urlopen(req, timeout=timeout)
+            if stream:
+                return response  # caller handles the streaming body
+            with response:
+                body = response.read()
+                return json.loads(body) if body[:1] in (b"{", b"[") else body.decode()
+
+        except urllib.error.HTTPError as exc:
+            detail = exc.read().decode(errors="replace")
+            hint = ""
+            if exc.code == 410:
+                hint = (
+                    "\nHint: this model was retired. "
+                    "Run `ollama list` and use an exact current model name."
+                )
+            if exc.code in _RETRYABLE_HTTP_CODES and attempt <= _MAX_RETRIES:
+                print(
+                    f"[warn] HTTP {exc.code} — retrying in {delay:.0f}s "
+                    f"(attempt {attempt}/{_MAX_RETRIES})...",
+                    file=sys.stderr,
+                )
+                time.sleep(delay)
+                delay *= 2
+                continue
+            raise RuntimeError(
+                f"Ollama API returned HTTP {exc.code}: {detail}{hint}"
+            ) from exc
+
+        except urllib.error.URLError as exc:
+            if attempt <= _MAX_RETRIES:
+                print(
+                    f"[warn] Network error — retrying in {delay:.0f}s "
+                    f"(attempt {attempt}/{_MAX_RETRIES}): {exc.reason}",
+                    file=sys.stderr,
+                )
+                time.sleep(delay)
+                delay *= 2
+                continue
+            hint = _url_error_hint(exc)
+            raise RuntimeError(
+                f"Unable to reach {BASE_URL}: {exc.reason}\n{hint}"
+            ) from exc
+
+    # Should never be reached, but satisfies type checkers.
+    raise RuntimeError("Exceeded maximum retry attempts.")
+
+
 def request_json(method: str, path: str, payload: dict[str, Any] | None = None) -> Any:
     data = json.dumps(payload).encode() if payload is not None else None
     req = urllib.request.Request(
         f"{BASE_URL}{path}", data=data, headers=headers(), method=method
     )
-    try:
-        with urllib.request.urlopen(req, timeout=300) as response:
-            body = response.read()
-            return json.loads(body) if body[:1] in (b"{", b"[") else body.decode()
-    except urllib.error.HTTPError as exc:
-        detail = exc.read().decode(errors="replace")
-        hint = ""
-        if exc.code == 410:
-            hint = "\nHint: this model was retired. Run `ollama list` and use an exact current model name."
-        raise RuntimeError(f"Ollama API returned HTTP {exc.code}: {detail}{hint}") from exc
-    except urllib.error.URLError as exc:
-        raise RuntimeError(f"Unable to reach {BASE_URL}: {exc.reason}") from exc
+    return _request_with_retry(req, timeout=_REQUEST_TIMEOUT)
 
 
 def stream_chat(model: str, messages: list[dict[str, str]]) -> str:
@@ -79,8 +166,9 @@ def stream_chat(model: str, messages: list[dict[str, str]]) -> str:
         method="POST",
     )
     full: list[str] = []
+    response = _request_with_retry(req, timeout=_STREAM_TIMEOUT, stream=True)
     try:
-        with urllib.request.urlopen(req, timeout=1800) as response:
+        with response:
             for raw_line in response:
                 line = raw_line.decode(errors="replace").strip()
                 if not line:
@@ -92,14 +180,9 @@ def stream_chat(model: str, messages: list[dict[str, str]]) -> str:
                     full.append(text)
                 if part.get("done"):
                     break
+    finally:
         print()
-        return "".join(full)
-    except urllib.error.HTTPError as exc:
-        detail = exc.read().decode(errors="replace")
-        hint = ""
-        if exc.code == 410:
-            hint = "\nHint: this model was retired. Run `ollama list` and use an exact current model name."
-        raise RuntimeError(f"Ollama API returned HTTP {exc.code}: {detail}{hint}") from exc
+    return "".join(full)
 
 
 def require_key() -> None:
@@ -160,6 +243,14 @@ Usage:
 Defaults:
   host:  {BASE_URL}
   model: {DEFAULT_MODEL}
+
+Environment overrides:
+  OLLAMA_HOST              API base URL (default: https://ollama.com)
+  OLLAMA_MODEL             Default model name
+  OLLAMA_REQUEST_TIMEOUT   Seconds before a non-streaming request times out (default: 300)
+  OLLAMA_STREAM_TIMEOUT    Seconds before a streaming request times out (default: 1800)
+  OLLAMA_MAX_RETRIES       Number of retries for transient errors (default: 3)
+  OLLAMA_RETRY_DELAY       Initial backoff delay in seconds (default: 2)
 
 Run `ollama list` before selecting a model because cloud models can be retired.
 This wrapper never starts a local daemon or downloads local model weights.
