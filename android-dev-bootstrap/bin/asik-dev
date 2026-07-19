@@ -498,7 +498,8 @@ cmd_update() {
 cmd_backup() {
   local include_secrets=0
   [[ "${1:-}" == "--include-secrets" ]] && include_secrets=1
-  local output="$HOME/asik-dev-backup-$(date +%Y%m%d-%H%M%S).tar.gz"
+  local output
+  output="$HOME/asik-dev-backup-$(date +%Y%m%d-%H%M%S).tar.gz"
   local staging
   staging="$(mktemp -d)"
   mkdir -p "$staging/config"

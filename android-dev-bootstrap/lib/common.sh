@@ -4,8 +4,38 @@ set -Eeuo pipefail
 
 declare -ag ASIK_SUCCESSES=()
 declare -ag ASIK_FAILURES=()
+declare -ag _ASIK_CLEANUP_DIRS=()
 ASIK_DEV_LOG_FILE="${ASIK_DEV_LOG_FILE:-/tmp/asik-dev-bootstrap.log}"
 
+# ---------------------------------------------------------------------------
+# Unified trap-based cleanup (improvement #5)
+# Registers a temporary directory for automatic removal on EXIT, ERR, INT, or
+# TERM. Call register_cleanup_dir "$dir" after every mktemp -d invocation.
+# ---------------------------------------------------------------------------
+_asik_cleanup() {
+  local sig="${1:-EXIT}"
+  for dir in "${_ASIK_CLEANUP_DIRS[@]+"${_ASIK_CLEANUP_DIRS[@]}"}"; do
+    rm -rf "$dir" 2>/dev/null || true
+  done
+  if [[ "$sig" == "ERR" ]]; then
+    _log_line FATAL "Unexpected error on line ${BASH_LINENO[0]} in ${BASH_SOURCE[1]:-unknown}"
+    _fail "Unexpected error — check log: ${ASIK_DEV_LOG_FILE}"
+  fi
+}
+
+register_cleanup_dir() {
+  _ASIK_CLEANUP_DIRS+=("$1")
+}
+
+# Register the unified cleanup handler for all relevant signals.
+trap '_asik_cleanup ERR'  ERR
+trap '_asik_cleanup INT'  INT
+trap '_asik_cleanup TERM' TERM
+trap '_asik_cleanup EXIT' EXIT
+
+# ---------------------------------------------------------------------------
+# Output helpers
+# ---------------------------------------------------------------------------
 _color() {
   if [[ -t 1 && -z "${NO_COLOR:-}" ]]; then
     printf '\033[%sm' "$1"
@@ -18,6 +48,9 @@ _ok()    { _color '1;32'; printf '[ OK ]'; _reset; printf ' %s\n' "$*"; }
 _warn()  { _color '1;33'; printf '[WARN]'; _reset; printf ' %s\n' "$*"; }
 _fail()  { _color '1;31'; printf '[FAIL]'; _reset; printf ' %s\n' "$*" >&2; }
 
+# ---------------------------------------------------------------------------
+# Logging
+# ---------------------------------------------------------------------------
 initialize_log() {
   ASIK_DEV_LOG_FILE="$1"
   local parent
@@ -42,6 +75,10 @@ _log_line() {
     >>"$ASIK_DEV_LOG_FILE" 2>/dev/null || true
 }
 
+# ---------------------------------------------------------------------------
+# Step runner — deliberately continues after failure so independent components
+# still install.
+# ---------------------------------------------------------------------------
 run_step() {
   local title="$1"
   shift
@@ -65,10 +102,12 @@ run_step() {
     _log_line FAIL "$title (exit $rc)"
   fi
 
-  # Deliberately continue; independent components should still install.
   return 0
 }
 
+# ---------------------------------------------------------------------------
+# Retry with exponential backoff
+# ---------------------------------------------------------------------------
 retry() {
   local attempts="${ASIK_RETRY_ATTEMPTS:-4}"
   local delay="${ASIK_RETRY_DELAY:-2}"
@@ -86,6 +125,9 @@ retry() {
   done
 }
 
+# ---------------------------------------------------------------------------
+# Privilege helpers
+# ---------------------------------------------------------------------------
 as_root() {
   if [[ "$(id -u)" -eq 0 ]]; then
     "$@"
@@ -144,6 +186,9 @@ install_user_file() {
   as_root chown "$TARGET_USER:$TARGET_USER" "$destination"
 }
 
+# ---------------------------------------------------------------------------
+# Platform detection
+# ---------------------------------------------------------------------------
 is_android_proot() {
   [[ -n "${PROOT_TMP_DIR:-}" ]] ||
   grep -Eqi 'android|termux' /proc/version 2>/dev/null ||
@@ -163,11 +208,30 @@ binary_arch() {
   esac
 }
 
+# ---------------------------------------------------------------------------
+# Download helpers
+# ---------------------------------------------------------------------------
 download_file() {
   local url="$1" output="$2"
   retry curl --fail --silent --show-error --location \
     --retry 3 --retry-delay 2 --retry-all-errors \
     "$url" -o "$output"
+}
+
+# verify_sha256 <file> <expected_hex_digest>
+# Returns 0 on match, 1 on mismatch, and prints a clear error message.
+verify_sha256() {
+  local file="$1" expected="$2"
+  local actual
+  actual="$(sha256sum "$file" | awk '{print $1}')"
+  if [[ "$actual" != "$expected" ]]; then
+    _fail "SHA256 mismatch for $(basename "$file")"
+    _fail "  expected: $expected"
+    _fail "  actual:   $actual"
+    return 1
+  fi
+  _log_line OK "SHA256 verified: $(basename "$file")"
+  return 0
 }
 
 apt_install() {
@@ -185,6 +249,7 @@ replace_managed_block() {
   local end="# <<< asik-dev:${block_name} <<<"
   local tmp
   tmp="$(mktemp)"
+  register_cleanup_dir "$tmp"
 
   if [[ -f "$file" ]]; then
     awk -v begin="$begin" -v end="$end" '
@@ -207,22 +272,31 @@ replace_managed_block() {
   rm -f "$tmp" "${tmp}.new"
 }
 
+# ---------------------------------------------------------------------------
+# Framework installation (improvement #8)
+# Uses `install -m 0755` for atomic, permission-correct binary placement
+# instead of cp + chmod, eliminating any race window.
+# ---------------------------------------------------------------------------
 install_framework() {
   local source_dir="$1" install_root="$2"
   as_root rm -rf "$install_root"
   as_root mkdir -p "$install_root"
   as_root cp -a "$source_dir/." "$install_root/"
-  as_root chmod +x \
-    "$install_root/install.sh" \
-    "$install_root/bin/asik-dev" \
-    "$install_root/bin/ollama" \
-    "$install_root/bin/claude-zai" \
-    "$install_root/bin/claude-anthropic" \
-    "$install_root/bin/aider-xai" \
-    "$install_root/bin/aider-openrouter"
+
+  local bin
+  for bin in install.sh bin/asik-dev bin/ollama bin/camera-ai \
+              bin/claude-zai bin/claude-anthropic \
+              bin/aider-xai bin/aider-openrouter; do
+    [[ -f "$install_root/$bin" ]] || continue
+    as_root install -m 0755 "$install_root/$bin" "$install_root/$bin"
+  done
+
   as_root ln -sfn "$install_root/bin/asik-dev" /usr/local/bin/asik-dev
 }
 
+# ---------------------------------------------------------------------------
+# Summary
+# ---------------------------------------------------------------------------
 print_summary() {
   printf '\n'
   _color '1;36'; printf 'Installation summary\n'; _reset

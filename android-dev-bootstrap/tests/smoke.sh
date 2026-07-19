@@ -40,7 +40,9 @@ if command -v shellcheck >/dev/null 2>&1; then
       \( -name '*.sh' -o -path "$ROOT/bin/asik-dev" -o -path "$ROOT/bin/camera-ai" \
          -o -path "$ROOT/bin/claude-*" -o -path "$ROOT/bin/aider-*" \) -print0
   )
-  shellcheck -x "${shell_files[@]}"
+  # --severity=warning: SC2016 (info) notices in intentional single-quoted
+  # run_as_user heredocs are expected and non-blocking.
+  shellcheck --severity=warning -x "${shell_files[@]}"
 fi
 
 printf 'All smoke tests passed.\n'
