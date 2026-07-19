@@ -116,7 +116,7 @@ trap 'rm -rf "$TMP_DIR"' EXIT
 FILES=(
   VERSION README.md lib/common.sh
   modules/10-base.sh modules/20-user.sh modules/30-shell.sh
-  modules/40-cloud.sh modules/50-ai.sh modules/60-config.sh
+  modules/40-cloud.sh modules/45-security.sh modules/50-ai.sh modules/60-config.sh
   bin/asik-dev bin/ollama bin/camera-ai
   bin/claude-zai bin/claude-anthropic bin/aider-xai bin/aider-openrouter
   templates/providers.env.example
@@ -140,6 +140,7 @@ source "$TMP_DIR/modules/10-base.sh"
 source "$TMP_DIR/modules/20-user.sh"
 source "$TMP_DIR/modules/30-shell.sh"
 source "$TMP_DIR/modules/40-cloud.sh"
+source "$TMP_DIR/modules/45-security.sh"
 source "$TMP_DIR/modules/50-ai.sh"
 source "$TMP_DIR/modules/60-config.sh"
 
@@ -150,6 +151,7 @@ export TARGET_HOME
 initialize_log "$TARGET_HOME/.local/state/asik-dev/install.log"
 module_shell
 module_cloud
+module_security
 module_ai
 
 INSTALL_ROOT="/opt/asik-dev-bootstrap"

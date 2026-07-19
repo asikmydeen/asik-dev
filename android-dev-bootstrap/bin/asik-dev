@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -Eeuo pipefail
 
-VERSION="1.1.0"
+VERSION="1.2.0"
 INSTALL_ROOT="${ASIK_DEV_INSTALL_ROOT:-/opt/asik-dev-bootstrap}"
 CONFIG_DIR="${XDG_CONFIG_HOME:-$HOME/.config}/asik-dev"
 PROVIDERS_FILE="${ASIK_DEV_PROVIDERS:-$CONFIG_DIR/providers.env}"
@@ -32,6 +32,8 @@ SECRET_KEYS=(
   AWS_REGION
   GOOGLE_CLOUD_PROJECT
   VERTEX_LOCATION
+  GITHUB_COPILOT_TOKEN
+  PULUMI_ACCESS_TOKEN
 )
 
 declare -A KEY_DESCRIPTIONS=(
@@ -39,7 +41,7 @@ declare -A KEY_DESCRIPTIONS=(
   [ANTHROPIC_API_KEY]="Anthropic API / Claude Code"
   [ZAI_API_KEY]="Z.AI GLM through Claude-compatible endpoint"
   [XAI_API_KEY]="xAI API / Grok Build"
-  [GEMINI_API_KEY]="Google Gemini API for compatible tools"
+  [GEMINI_API_KEY]="Google Gemini API / Gemini CLI"
   [OPENROUTER_API_KEY]="OpenRouter"
   [CURSOR_API_KEY]="Cursor Agent CLI and Background Agent API"
   [OLLAMA_API_KEY]="Direct Ollama Cloud API"
@@ -58,6 +60,8 @@ declare -A KEY_DESCRIPTIONS=(
   [AWS_REGION]="Default AWS region"
   [GOOGLE_CLOUD_PROJECT]="Default Google Cloud project"
   [VERTEX_LOCATION]="Vertex AI location"
+  [GITHUB_COPILOT_TOKEN]="GitHub Copilot CLI token"
+  [PULUMI_ACCESS_TOKEN]="Pulumi Cloud access token"
 )
 
 usage() {
@@ -75,9 +79,27 @@ Usage:
   asik-dev update                     Update the full environment
   asik-dev repair                     Rerun the idempotent installer
   asik-dev backup [--include-secrets] Create a configuration backup
+  asik-dev restore <backup.tar.gz>    Restore a configuration backup
+  asik-dev new <template> [name]      Scaffold a new project from a template
+  asik-dev sync [--dotfiles-repo URL] Sync dotfiles from a remote repository
+  asik-dev env                        Show active per-project .asik-dev.env
+  asik-dev mcp list                   List registered MCP servers
+  asik-dev mcp add <name> <cmd...>    Add an MCP server to all config files
+  asik-dev mcp remove <name>          Remove an MCP server from all config files
   asik-dev help
+
+Templates for 'asik-dev new':
+  fastapi   Python FastAPI project with uv, Dockerfile, and .mise.toml
+  next      Next.js project with TypeScript and pnpm
+  go        Go module with Makefile and .mise.toml
+  rust      Rust binary crate with Cargo.toml
+  generic   Generic project with .mise.toml, .env.example, and README.md
 HELP
 }
+
+# ---------------------------------------------------------------------------
+# Secrets management
+# ---------------------------------------------------------------------------
 
 ensure_providers_file() {
   mkdir -p "$CONFIG_DIR"
@@ -206,6 +228,10 @@ clear_secret() {
   set_provider_value "$key" ""
   printf 'Cleared %s.\n' "$key"
 }
+
+# ---------------------------------------------------------------------------
+# MCP configuration
+# ---------------------------------------------------------------------------
 
 write_mcp_configs() {
   ensure_providers_file
@@ -357,19 +383,449 @@ cmd_configure() {
   printf 'Canonical MCP configuration: %s\n' "$MCP_FILE"
 }
 
+# ---------------------------------------------------------------------------
+# asik-dev mcp — manage MCP servers across all config files
+# ---------------------------------------------------------------------------
+
+_mcp_list_servers() {
+  if [[ ! -f "$MCP_FILE" ]]; then
+    printf 'No MCP configuration found. Run: asik-dev configure\n' >&2
+    return 1
+  fi
+  printf 'Registered MCP servers:\n'
+  python3 - "$MCP_FILE" <<'PY_MCP_LIST'
+import json, sys
+data = json.loads(open(sys.argv[1]).read())
+servers = data.get("mcpServers", {})
+if not servers:
+    print("  (none)")
+else:
+    for name, cfg in servers.items():
+        cmd = " ".join([cfg.get("command", "")] + cfg.get("args", []))
+        print(f"  {name:<30} {cmd}")
+PY_MCP_LIST
+}
+
+_mcp_add_server() {
+  local name="$1"
+  shift
+  local cmd_parts=("$@")
+  [[ ${#cmd_parts[@]} -ge 1 ]] || {
+    printf 'Usage: asik-dev mcp add <name> <command> [args...]\n' >&2
+    return 2
+  }
+
+  local command="${cmd_parts[0]}"
+  local args_json
+  args_json="$(python3 -c "import json,sys; print(json.dumps(sys.argv[1:]))" -- "${cmd_parts[@]:1}")"
+
+  local mcp_targets=(
+    "$MCP_FILE"
+    "$HOME/.cursor/mcp.json"
+    "$HOME/.gemini/config/mcp_config.json"
+  )
+
+  for target in "${mcp_targets[@]}"; do
+    [[ -f "$target" ]] || continue
+    MCP_TARGET="$target" MCP_NAME="$name" MCP_CMD="$command" MCP_ARGS="$args_json" \
+      python3 - <<'PY_MCP_ADD'
+import json, os
+from pathlib import Path
+
+path = Path(os.environ["MCP_TARGET"])
+data = json.loads(path.read_text())
+data.setdefault("mcpServers", {})[os.environ["MCP_NAME"]] = {
+    "command": os.environ["MCP_CMD"],
+    "args": json.loads(os.environ["MCP_ARGS"]),
+}
+path.write_text(json.dumps(data, indent=2) + "\n")
+PY_MCP_ADD
+    printf '[OK] Updated %s\n' "$target"
+  done
+
+  # Also register with claude and codex CLIs if available.
+  if command -v claude >/dev/null 2>&1; then
+    claude mcp remove "$name" --scope user >/dev/null 2>&1 || true
+    claude mcp add "$name" --scope user -- "${cmd_parts[@]}" >/dev/null 2>&1 || true
+  fi
+  if command -v codex >/dev/null 2>&1; then
+    codex mcp remove "$name" >/dev/null 2>&1 || true
+    codex mcp add "$name" -- "${cmd_parts[@]}" >/dev/null 2>&1 || true
+  fi
+
+  printf 'MCP server "%s" added to all config files.\n' "$name"
+}
+
+_mcp_remove_server() {
+  local name="$1"
+  local mcp_targets=(
+    "$MCP_FILE"
+    "$HOME/.cursor/mcp.json"
+    "$HOME/.gemini/config/mcp_config.json"
+  )
+
+  for target in "${mcp_targets[@]}"; do
+    [[ -f "$target" ]] || continue
+    MCP_TARGET="$target" MCP_NAME="$name" python3 - <<'PY_MCP_REMOVE'
+import json, os
+from pathlib import Path
+
+path = Path(os.environ["MCP_TARGET"])
+data = json.loads(path.read_text())
+data.get("mcpServers", {}).pop(os.environ["MCP_NAME"], None)
+path.write_text(json.dumps(data, indent=2) + "\n")
+PY_MCP_REMOVE
+    printf '[OK] Updated %s\n' "$target"
+  done
+
+  if command -v claude >/dev/null 2>&1; then
+    claude mcp remove "$name" --scope user >/dev/null 2>&1 || true
+  fi
+  if command -v codex >/dev/null 2>&1; then
+    codex mcp remove "$name" >/dev/null 2>&1 || true
+  fi
+
+  printf 'MCP server "%s" removed from all config files.\n' "$name"
+}
+
+cmd_mcp() {
+  local action="${1:-list}"
+  shift || true
+  case "$action" in
+    list) _mcp_list_servers ;;
+    add)
+      [[ -n "${1:-}" ]] || { printf 'Usage: asik-dev mcp add <name> <cmd...>\n' >&2; return 2; }
+      _mcp_add_server "$@"
+      ;;
+    remove|rm)
+      [[ -n "${1:-}" ]] || { printf 'Usage: asik-dev mcp remove <name>\n' >&2; return 2; }
+      _mcp_remove_server "$1"
+      ;;
+    *)
+      printf 'Unknown mcp action: %s\n' "$action" >&2
+      return 2
+      ;;
+  esac
+}
+
+# ---------------------------------------------------------------------------
+# asik-dev new — project scaffolding
+# ---------------------------------------------------------------------------
+
+cmd_new() {
+  local template="${1:-}"
+  local project_name="${2:-}"
+  [[ -n "$template" ]] || {
+    printf 'Usage: asik-dev new <template> [project-name]\n' >&2
+    printf 'Templates: fastapi  next  go  rust  generic\n' >&2
+    return 2
+  }
+
+  if [[ -z "$project_name" ]]; then
+    project_name="${template}-project"
+  fi
+
+  local dest="$HOME/projects/$project_name"
+  if [[ -d "$dest" ]]; then
+    printf '[FAIL] Directory already exists: %s\n' "$dest" >&2
+    return 1
+  fi
+
+  mkdir -p "$dest"
+  printf 'Scaffolding %s project in %s...\n' "$template" "$dest"
+
+  case "$template" in
+    fastapi)
+      cat >"$dest/.mise.toml" <<MISE
+[tools]
+python = "3.12"
+MISE
+      cat >"$dest/pyproject.toml" <<PYPROJECT
+[project]
+name = "$project_name"
+version = "0.1.0"
+requires-python = ">=3.12"
+dependencies = ["fastapi>=0.115", "uvicorn[standard]>=0.30"]
+PYPROJECT
+      mkdir -p "$dest/app"
+      cat >"$dest/app/main.py" <<'FASTAPI'
+from fastapi import FastAPI
+
+app = FastAPI()
+
+@app.get("/")
+def root():
+    return {"status": "ok"}
+FASTAPI
+      cat >"$dest/Dockerfile" <<'DOCKERFILE'
+FROM python:3.12-slim
+WORKDIR /app
+COPY . .
+RUN pip install uv && uv pip install --system -e .
+CMD ["uvicorn", "app.main:app", "--host", "0.0.0.0", "--port", "8000"]
+DOCKERFILE
+      ;;
+
+    next)
+      cat >"$dest/.mise.toml" <<MISE
+[tools]
+node = "lts"
+MISE
+      cat >"$dest/package.json" <<PKGJSON
+{
+  "name": "$project_name",
+  "version": "0.1.0",
+  "private": true,
+  "scripts": {
+    "dev": "next dev",
+    "build": "next build",
+    "start": "next start"
+  },
+  "dependencies": {
+    "next": "latest",
+    "react": "latest",
+    "react-dom": "latest"
+  },
+  "devDependencies": {
+    "typescript": "latest",
+    "@types/node": "latest",
+    "@types/react": "latest"
+  }
+}
+PKGJSON
+      mkdir -p "$dest/app"
+      cat >"$dest/app/page.tsx" <<'NEXTPAGE'
+export default function Home() {
+  return <main><h1>Hello from {process.env.NEXT_PUBLIC_APP_NAME || "Next.js"}!</h1></main>;
+}
+NEXTPAGE
+      ;;
+
+    go)
+      cat >"$dest/.mise.toml" <<MISE
+[tools]
+go = "latest"
+MISE
+      cat >"$dest/Makefile" <<'MAKEFILE'
+.PHONY: build run test
+
+build:
+	go build -o bin/app ./cmd/app
+
+run:
+	go run ./cmd/app
+
+test:
+	go test ./...
+MAKEFILE
+      mkdir -p "$dest/cmd/app"
+      cat >"$dest/cmd/app/main.go" <<GOCODE
+package main
+
+import "fmt"
+
+func main() {
+	fmt.Println("Hello from $project_name!")
+}
+GOCODE
+      ( cd "$dest" && go mod init "github.com/$(id -un)/$project_name" 2>/dev/null || true )
+      ;;
+
+    rust)
+      cat >"$dest/.mise.toml" <<MISE
+[tools]
+rust = "stable"
+MISE
+      cat >"$dest/Cargo.toml" <<CARGO
+[package]
+name = "$project_name"
+version = "0.1.0"
+edition = "2021"
+CARGO
+      mkdir -p "$dest/src"
+      cat >"$dest/src/main.rs" <<'RUST'
+fn main() {
+    println!("Hello from asik-dev!");
+}
+RUST
+      ;;
+
+    generic|*)
+      cat >"$dest/.mise.toml" <<MISE
+[tools]
+# Add your runtime versions here, e.g.:
+# node = "lts"
+# python = "3.12"
+MISE
+      cat >"$dest/.env.example" <<'ENVEX'
+# Copy to .env and fill in values. Never commit .env.
+APP_NAME=my-app
+ENVEX
+      ;;
+  esac
+
+  # Common files for all templates.
+  cat >"$dest/README.md" <<README
+# $project_name
+
+Scaffolded with \`asik-dev new $template\`.
+
+## Getting started
+
+\`\`\`bash
+cd $dest
+mise install   # install pinned runtimes
+\`\`\`
+README
+
+  cat >"$dest/.gitignore" <<'GITIGNORE'
+.env
+.env.local
+.asik-dev.env
+__pycache__/
+*.pyc
+node_modules/
+.next/
+dist/
+target/
+bin/
+GITIGNORE
+
+  printf '[OK] Project created: %s\n' "$dest"
+  printf 'Next steps:\n'
+  printf '  cd %s\n' "$dest"
+  printf '  mise install\n'
+}
+
+# ---------------------------------------------------------------------------
+# asik-dev sync — pull dotfiles from a remote repository
+# ---------------------------------------------------------------------------
+
+cmd_sync() {
+  local dotfiles_repo="${ASIK_DEV_DOTFILES_REPO:-}"
+  while (($#)); do
+    case "$1" in
+      --dotfiles-repo) dotfiles_repo="${2:?--dotfiles-repo requires a URL}"; shift 2 ;;
+      *) printf 'Unknown option: %s\n' "$1" >&2; return 2 ;;
+    esac
+  done
+
+  if [[ -z "$dotfiles_repo" ]]; then
+    printf 'No dotfiles repository configured.\n'
+    printf 'Set ASIK_DEV_DOTFILES_REPO in providers.env or pass --dotfiles-repo <url>\n'
+    return 0
+  fi
+
+  local dotfiles_dir="$HOME/.dotfiles"
+  if [[ -d "$dotfiles_dir/.git" ]]; then
+    printf 'Pulling latest dotfiles from %s...\n' "$dotfiles_repo"
+    git -C "$dotfiles_dir" pull --ff-only
+  else
+    printf 'Cloning dotfiles from %s...\n' "$dotfiles_repo"
+    git clone --depth 1 "$dotfiles_repo" "$dotfiles_dir"
+  fi
+
+  # Symlink any .<file> in the dotfiles repo root into $HOME.
+  local linked=0
+  while IFS= read -r -d '' file; do
+    local basename
+    basename="$(basename "$file")"
+    local target="$HOME/$basename"
+    if [[ ! -e "$target" || -L "$target" ]]; then
+      ln -sfn "$file" "$target"
+      printf '[OK] Linked %s -> %s\n' "$target" "$file"
+      linked=$((linked + 1))
+    else
+      printf '[SKIP] %s already exists and is not a symlink\n' "$target"
+    fi
+  done < <(find "$dotfiles_dir" -maxdepth 1 -name '.*' -not -name '.git' -not -name '.' -print0)
+
+  printf 'Sync complete. %d file(s) linked.\n' "$linked"
+}
+
+# ---------------------------------------------------------------------------
+# asik-dev env — show active per-project .asik-dev.env
+# ---------------------------------------------------------------------------
+
+cmd_env() {
+  local dir="$PWD"
+  while [[ "$dir" != "/" ]]; do
+    if [[ -f "$dir/.asik-dev.env" ]]; then
+      printf 'Active project env: %s\n\n' "$dir/.asik-dev.env"
+      cat "$dir/.asik-dev.env"
+      return 0
+    fi
+    dir="$(dirname "$dir")"
+  done
+  printf 'No .asik-dev.env found in %s or any parent directory.\n' "$PWD"
+  printf 'Create one with project-specific overrides, e.g.:\n'
+  printf '  echo "OPENAI_API_KEY=sk-proj-..." > .asik-dev.env\n'
+  printf '  echo ".asik-dev.env" >> .gitignore\n'
+}
+
+# ---------------------------------------------------------------------------
+# asik-dev restore — restore a configuration backup
+# ---------------------------------------------------------------------------
+
+cmd_restore() {
+  local archive="${1:-}"
+  [[ -n "$archive" ]] || {
+    printf 'Usage: asik-dev restore <backup.tar.gz>\n' >&2
+    return 2
+  }
+  [[ -f "$archive" ]] || {
+    printf '[FAIL] File not found: %s\n' "$archive" >&2
+    return 1
+  }
+
+  local staging
+  staging="$(mktemp -d)"
+  tar -xzf "$archive" -C "$staging"
+
+  if [[ -d "$staging/config" ]]; then
+    mkdir -p "$CONFIG_DIR"
+    cp -a "$staging/config/." "$CONFIG_DIR/"
+    chmod 0700 "$CONFIG_DIR"
+    [[ -f "$CONFIG_DIR/providers.env" ]] && chmod 0600 "$CONFIG_DIR/providers.env"
+    printf '[OK] Restored config to %s\n' "$CONFIG_DIR"
+  fi
+
+  for dotfile in .zshrc .bashrc; do
+    if [[ -f "$staging/$dotfile" ]]; then
+      cp "$staging/$dotfile" "$HOME/$dotfile"
+      printf '[OK] Restored %s\n' "$HOME/$dotfile"
+    fi
+  done
+
+  if [[ -f "$staging/grok/config.toml" ]]; then
+    mkdir -p "$HOME/.grok"
+    cp "$staging/grok/config.toml" "$HOME/.grok/config.toml"
+    chmod 0600 "$HOME/.grok/config.toml"
+    printf '[OK] Restored ~/.grok/config.toml\n'
+  fi
+
+  rm -rf "$staging"
+  printf 'Restore complete. Run: asik-dev configure\n'
+}
+
+# ---------------------------------------------------------------------------
+# Versions and doctor
+# ---------------------------------------------------------------------------
+
 version_line() {
   local name="$1"
   shift
   if command -v "$name" >/dev/null 2>&1; then
     local output
     output="$(timeout 15 "$@" 2>&1 | head -n 1 || true)"
-    printf '%-18s %s\n' "$name" "${output:-installed}"
+    printf '%-20s %s\n' "$name" "${output:-installed}"
   else
-    printf '%-18s %s\n' "$name" missing
+    printf '%-20s %s\n' "$name" missing
   fi
 }
 
 cmd_versions() {
+  printf '=== Cloud & Infrastructure ===\n'
   version_line git git --version
   version_line gh gh --version
   version_line aws aws --version
@@ -377,9 +833,13 @@ cmd_versions() {
   version_line gcloud gcloud version
   version_line terraform terraform version
   version_line tofu tofu version
+  version_line pulumi pulumi version
   version_line kubectl kubectl version --client
   version_line helm helm version --short
   version_line k9s k9s version --short
+  version_line argocd argocd version --client
+  version_line flux flux version
+  printf '\n=== Languages & Runtimes ===\n'
   version_line node node --version
   version_line npm npm --version
   version_line pnpm pnpm --version
@@ -387,14 +847,27 @@ cmd_versions() {
   version_line uv uv --version
   version_line go go version
   version_line rustc rustc --version
+  version_line mise mise --version
+  printf '\n=== AI Coding Tools ===\n'
   version_line claude claude --version
   version_line codex codex --version
+  version_line gemini gemini --version
+  version_line goose goose --version
   version_line cursor-agent cursor-agent --version
   version_line grok grok --version
   version_line agy agy --version
   version_line opencode opencode --version
   version_line aider aider --version
   version_line ollama ollama version
+  printf '\n=== Developer Productivity ===\n'
+  version_line lazygit lazygit --version
+  version_line lazydocker lazydocker --version
+  version_line atuin atuin --version
+  version_line zoxide zoxide --version
+  version_line delta delta --version
+  version_line tldr tldr --version
+  version_line age age --version
+  version_line sops sops --version
 }
 
 check_command() {
@@ -420,17 +893,23 @@ check_json() {
 cmd_doctor() {
   local failures=0 tool
   local tools=(
-    git gh aws az gcloud terraform tofu kubectl helm k9s kubectx kubens
-    node npm pnpm python3 uv go rustc claude codex cursor-agent grok agy
-    opencode aider ollama
+    # Cloud & Infrastructure
+    git gh aws az gcloud terraform tofu pulumi kubectl helm k9s kubectx kubens argocd flux
+    # Languages & Runtimes
+    node npm pnpm python3 uv go rustc mise
+    # AI Coding Tools
+    claude codex gemini goose cursor-agent grok agy opencode aider ollama
+    # Developer Productivity
+    lazygit lazydocker atuin zoxide delta age sops
   )
 
   printf 'Asik Dev doctor %s\n\n' "$VERSION"
+  printf '=== Tool availability ===\n'
   for tool in "${tools[@]}"; do
     check_command "$tool" || failures=$((failures + 1))
   done
 
-  printf '\nConfiguration\n'
+  printf '\n=== Configuration ===\n'
   ensure_providers_file
   local mode
   mode="$(stat -c '%a' "$PROVIDERS_FILE" 2>/dev/null || true)"
@@ -446,7 +925,7 @@ cmd_doctor() {
   check_json "$HOME/.gemini/config/mcp_config.json" || failures=$((failures + 1))
   check_json "$HOME/.config/opencode/opencode.json" || failures=$((failures + 1))
 
-  printf '\nAuthentication (non-destructive checks)\n'
+  printf '\n=== Authentication (non-destructive checks) ===\n'
   if command -v gh >/dev/null 2>&1 && timeout 15 gh auth status >/dev/null 2>&1; then
     printf '[OK]   GitHub CLI authenticated\n'
   else
@@ -480,12 +959,16 @@ cmd_doctor() {
     printf '[INFO] Cursor: set CURSOR_API_KEY or run `cursor-agent login`\n'
   fi
 
-  printf '\nProvider keys\n'
+  printf '\n=== Provider keys ===\n'
   secrets_status
 
   printf '\nDoctor result: %d missing/invalid installation checks.\n' "$failures"
   return "$failures"
 }
+
+# ---------------------------------------------------------------------------
+# Update, backup, secrets
+# ---------------------------------------------------------------------------
 
 cmd_update() {
   local target_user
@@ -548,6 +1031,10 @@ cmd_secrets() {
   esac
 }
 
+# ---------------------------------------------------------------------------
+# Entry point
+# ---------------------------------------------------------------------------
+
 main() {
   local command="${1:-help}"
   shift || true
@@ -558,6 +1045,11 @@ main() {
     versions) cmd_versions ;;
     update|repair) cmd_update ;;
     backup) cmd_backup "$@" ;;
+    restore) cmd_restore "$@" ;;
+    new) cmd_new "$@" ;;
+    sync) cmd_sync "$@" ;;
+    env) cmd_env ;;
+    mcp) cmd_mcp "$@" ;;
     help|-h|--help) usage ;;
     version|--version|-v) printf 'asik-dev %s\n' "$VERSION" ;;
     *)
